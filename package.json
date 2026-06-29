@@ -1,0 +1,40 @@
+{
+  "name": "kryptos-mobile",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.ts",
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "start": "expo start",
+    "web": "expo start --web",
+    "android": "expo run:android",
+    "prebuild:android": "expo prebuild --platform android",
+    "apk:debug": "powershell -ExecutionPolicy Bypass -File scripts/build-debug-apk.ps1",
+    "apk:release": "powershell -ExecutionPolicy Bypass -File scripts/build-release-apk.ps1",
+    "test": "node --experimental-strip-types tests/run.ts",
+    "typecheck": "tsc --noEmit",
+    "ios": "expo run:ios"
+  },
+  "dependencies": {
+    "@expo/metro-runtime": "~6.1.2",
+    "@noble/ciphers": "^2.2.0",
+    "expo": "~54.0.35",
+    "expo-clipboard": "~8.0.8",
+    "expo-crypto": "~15.0.9",
+    "expo-file-system": "~19.0.23",
+    "expo-local-authentication": "~17.0.8",
+    "expo-screen-capture": "~8.0.9",
+    "expo-secure-store": "~15.0.8",
+    "expo-status-bar": "~3.0.9",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "react-native": "0.81.5",
+    "react-native-web": "0.21.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "@types/react": "^19.1.17",
+    "typescript": "~5.9.3"
+  }
+}

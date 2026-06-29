@@ -1,0 +1,38 @@
+{
+  "expo": {
+    "name": "Kryptos Mobile",
+    "slug": "kryptos-mobile",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "kryptosmobile",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.huasushis.kryptosmobile"
+    },
+    "android": {
+      "package": "com.huasushis.kryptosmobile",
+      "permissions": [
+        "USE_BIOMETRIC",
+        "USE_FINGERPRINT"
+      ]
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    },
+    "plugins": [
+      [
+        "expo-secure-store",
+        {
+          "configureAndroidBackup": false,
+          "faceIDPermission": "Allow Kryptos Mobile to unlock your encrypted vault."
+        }
+      ]
+    ]
+  }
+}
