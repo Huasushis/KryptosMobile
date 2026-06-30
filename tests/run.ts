@@ -1,23 +1,40 @@
 import assert from 'node:assert/strict';
 import { webcrypto } from 'node:crypto';
 
-import { bytesHex, hmacSha256, deriveKey, encryptKryptos, decryptKryptos } from '../src/kryptos/crypto.ts';
+import {
+  bytesHex,
+  hmacSha256,
+  deriveKey,
+  encryptKryptos,
+  decryptKryptos,
+  setNativeDeriveKey,
+} from '../src/kryptos/crypto.ts';
 import { charset, constructSeed, DeterministicStream, generatePassword, sha256Hex } from '../src/kryptos/core.ts';
 import {
   deserializeEntries,
   escapeField,
   exportEntriesBase64,
+  exportEntriesBase64Async,
   generateEntryPassword,
   importEntriesBase64,
+  importEntriesBase64Async,
   mergeEntries,
   serializeEntries,
   type AccountEntry,
 } from '../src/kryptos/manager.ts';
-import { utf8String } from '../src/kryptos/bytes.ts';
+import { base64ToBytes, utf8String } from '../src/kryptos/bytes.ts';
 import { decryptAesGcm, encryptAesGcmWithNonce } from '../src/vault/aesGcm.ts';
 import { assertMobileAuthenticationAvailable } from '../src/platform/authPolicy.ts';
-import { createVaultEntryFromUuid, importVaultBackup, validateVaultState } from '../src/vault/model.ts';
-import type { VaultEntry } from '../src/vault/types.ts';
+import {
+  createVaultEntryFromUuid,
+  exportVaultForBackup,
+  exportVaultForBackupAsync,
+  importVaultBackup,
+  importVaultBackupAsync,
+  validateVaultState,
+} from '../src/vault/model.ts';
+import { DATA_KEY_ID, PREFIX_KEY_ID } from '../src/vault/constants.ts';
+import { emptyVault, type VaultEntry } from '../src/vault/types.ts';
 
 if (!globalThis.crypto?.subtle) {
   Object.defineProperty(globalThis, 'crypto', {
@@ -28,6 +45,7 @@ if (!globalThis.crypto?.subtle) {
 
 const fullCrypto = process.env.KRYPTOS_FULL_CRYPTO === '1';
 const testCipherOptions = fullCrypto ? {} : { kdfIterations: 32 };
+const quickAsyncCipherOptions = { kdfIterations: 32, yieldEveryIterations: 4 };
 
 function run(name: string, fn: () => void): void {
   fn();
@@ -116,6 +134,53 @@ run('KryptosCore export and import round trip with encryption', () => {
   assert.throws(() => importEntriesBase64(exported, 'wrong_key', testCipherOptions));
 });
 
+await runAsync('async KryptosCore backup crypto matches sync format without blocking contract changes', async () => {
+  const entries: AccountEntry[] = [
+    {
+      webname: 'async.example',
+      uuid: 'abc123',
+      username: 'async-user',
+      length: 16,
+      charsetPreset: 'full',
+    },
+  ];
+  const nonce = new Uint8Array(16).fill(0x34);
+  const syncExport = exportEntriesBase64(entries, 'p', nonce, quickAsyncCipherOptions);
+  const asyncExport = await exportEntriesBase64Async(entries, 'p', nonce, quickAsyncCipherOptions);
+  assert.equal(asyncExport, syncExport);
+  assert.deepEqual(
+    await importEntriesBase64Async(asyncExport, 'p', quickAsyncCipherOptions),
+    entries,
+  );
+});
+
+await runAsync('native async PBKDF2 hook preserves KryptosCore backup format', async () => {
+  const entries: AccountEntry[] = [
+    {
+      webname: 'native-hook.example',
+      uuid: 'native123',
+      username: 'native-user',
+      length: 16,
+      charsetPreset: 'full',
+    },
+  ];
+  const nonce = new Uint8Array(16).fill(0x56);
+  let calls = 0;
+  setNativeDeriveKey(async (password, salt, iterations) => {
+    calls += 1;
+    return deriveKey(password, salt, iterations);
+  });
+  try {
+    const syncExport = exportEntriesBase64(entries, 'native-pass', nonce, quickAsyncCipherOptions);
+    const asyncExport = await exportEntriesBase64Async(entries, 'native-pass', nonce, quickAsyncCipherOptions);
+    assert.equal(asyncExport, syncExport);
+    assert.deepEqual(await importEntriesBase64Async(asyncExport, 'native-pass', quickAsyncCipherOptions), entries);
+    assert.equal(calls, 2);
+  } finally {
+    setNativeDeriveKey(null);
+  }
+});
+
 run('merge import skips duplicate site and username pairs', () => {
   const current: AccountEntry[] = [
     {
@@ -129,6 +194,38 @@ run('merge import skips duplicate site and username pairs', () => {
   const incoming: AccountEntry[] = [
     {
       webname: 'example.com',
+      uuid: 'uuid-b',
+      username: 'alice',
+      length: 20,
+      charsetPreset: 'alphanum',
+    },
+    {
+      webname: 'example.com',
+      uuid: 'uuid-c',
+      username: 'bob',
+      length: 20,
+      charsetPreset: 'alphanum',
+    },
+  ];
+  const merged = mergeEntries(current, incoming);
+  assert.equal(merged.length, 2);
+  assert.equal(merged[0].uuid, 'uuid-a');
+  assert.equal(merged[1].username, 'bob');
+});
+
+run('merge import normalizes duplicate site and username pairs', () => {
+  const current: AccountEntry[] = [
+    {
+      webname: 'Example.com',
+      uuid: 'uuid-a',
+      username: ' Alice ',
+      length: 16,
+      charsetPreset: 'full',
+    },
+  ];
+  const incoming: AccountEntry[] = [
+    {
+      webname: 'example.COM ',
       uuid: 'uuid-b',
       username: 'alice',
       length: 20,
@@ -270,6 +367,29 @@ run('vault backup merge and replace policies are explicit', () => {
   assert.equal(replaced[0].uuid, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
 });
 
+await runAsync('vault backup accepts any non-empty password and async import export round trips', async () => {
+  const current: VaultEntry[] = [
+    {
+      id: 'short-pass-id',
+      webname: 'short.example',
+      username: 'alice',
+      uuid: 'dddddddddddddddddddddddddddddddd',
+      length: 16,
+      charsetPreset: 'full',
+      createdAt: '2026-06-28T00:00:00.000Z',
+      updatedAt: '2026-06-28T00:00:00.000Z',
+    },
+  ];
+  const nonce = new Uint8Array(16).fill(0x24);
+  const exported = exportVaultForBackup(current, 'x', nonce, testCipherOptions);
+  assert.deepEqual(importVaultBackup(exported, 'x', [], 'replace', testCipherOptions).map((entry) => entry.webname), ['short.example']);
+  const asyncExported = await exportVaultForBackupAsync(current, 'x', nonce, quickAsyncCipherOptions);
+  const asyncImported = await importVaultBackupAsync(asyncExported, 'x', [], 'replace', quickAsyncCipherOptions);
+  assert.equal(asyncImported[0].username, 'alice');
+  assert.throws(() => exportVaultForBackup(current, '', nonce, testCipherOptions));
+  await assert.rejects(() => exportVaultForBackupAsync(current, '', nonce, testCipherOptions));
+});
+
 run('KryptosCore backup payload hides site username prefix and generated password', () => {
   const entry = {
     webname: 'audit-secret.example',
@@ -289,21 +409,40 @@ run('KryptosCore backup payload hides site username prefix and generated passwor
 
 run('import validation rejects malformed counts fields lengths and duplicates', () => {
   assert.throws(() => deserializeEntries('NOT-KRYPTOS\n0\n'));
+  assert.throws(() => deserializeEntries('KRYPTOS:V1\n1x\n'));
   assert.throws(() => deserializeEntries('KRYPTOS:V1\n10001\n'));
   assert.throws(() => deserializeEntries('KRYPTOS:V1\n1\nonly\tfour\tfields\there\n'));
+  assert.throws(() => deserializeEntries('KRYPTOS:V1\n1\nexample.com\tuuid-a\talice\t16abc\tfull\n'));
   const tooLongSite = 'a'.repeat(201);
   assert.throws(() => deserializeEntries(`KRYPTOS:V1\n1\n${escapeField(tooLongSite)}\tuuid\tuser\t16\tfull\n`));
   assert.throws(() =>
     deserializeEntries('KRYPTOS:V1\n2\nexample.com\tuuid-a\talice\t16\tfull\nexample.com\tuuid-b\talice\t16\tfull\n'),
   );
+  assert.throws(() =>
+    deserializeEntries('KRYPTOS:V1\n2\nExample.com\tuuid-a\t Alice \t16\tfull\n example.COM \tuuid-b\talice\t16\tfull\n'),
+  );
   assert.throws(() => deserializeEntries('KRYPTOS:V1\n0\nunexpected\tdata\tafter\tcount\tfull\n'));
   assert.deepEqual(deserializeEntries('KRYPTOS:V1\n0\n\n'), []);
 });
 
-run('mobile authentication policy fails closed without hardware or enrollment', () => {
-  assert.throws(() => assertMobileAuthenticationAvailable(false, true));
-  assert.throws(() => assertMobileAuthenticationAvailable(true, false));
-  assert.doesNotThrow(() => assertMobileAuthenticationAvailable(true, true));
+run('base64 import rejects invalid padding', () => {
+  assert.throws(() => base64ToBytes('===='));
+  assert.throws(() => base64ToBytes('AA=A'));
+  assert.throws(() => base64ToBytes('AAA=AAAA'));
+});
+
+run('mobile authentication policy fails closed without device security', () => {
+  assert.throws(() => assertMobileAuthenticationAvailable(0));
+  assert.doesNotThrow(() => assertMobileAuthenticationAvailable(1));
+  assert.doesNotThrow(() => assertMobileAuthenticationAvailable(3));
+});
+
+run('SecureStore key ids are valid on native platforms', () => {
+  for (const key of [DATA_KEY_ID, PREFIX_KEY_ID]) {
+    assert.match(key, /^[A-Za-z0-9._-]+$/);
+    assert.equal(key.includes(':'), false);
+    assert.notEqual(key.length, 0);
+  }
 });
 
 run('vault state validation rejects duplicates and clamps settings', () => {
@@ -349,6 +488,24 @@ run('vault state validation rejects duplicates and clamps settings', () => {
   assert.equal(clean.settings.backgroundLockSeconds, 5);
   assert.equal(clean.settings.preventScreenshots, false);
   assert.equal(clean.settings.importMode, 'merge');
+});
+
+run('vault settings clamp background lock to at most 30 seconds', () => {
+  const clean = validateVaultState({
+    version: 1,
+    entries: [],
+    settings: {
+      backgroundLockSeconds: 300,
+    },
+  });
+  assert.equal(clean.settings.backgroundLockSeconds, 30);
+});
+
+run('empty vault returns independent settings objects', () => {
+  const first = emptyVault();
+  const second = emptyVault();
+  first.settings.autoLockMinutes = 42;
+  assert.equal(second.settings.autoLockMinutes, 5);
 });
 
 await runAsync('local vault AES-GCM hides metadata and detects tampering', async () => {

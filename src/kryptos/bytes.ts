@@ -65,6 +65,13 @@ export function base64ToBytes(input: string): Uint8Array {
   if (cleaned.length % 4 !== 0 || /[^A-Za-z0-9+/=]/.test(cleaned)) {
     throw new Error('invalid base64 data');
   }
+  if (!/^[A-Za-z0-9+/]*(?:={0,2})$/.test(cleaned)) {
+    throw new Error('invalid base64 data');
+  }
+  const firstPadding = cleaned.indexOf('=');
+  if (firstPadding !== -1 && firstPadding < cleaned.length - (cleaned.endsWith('==') ? 2 : 1)) {
+    throw new Error('invalid base64 data');
+  }
   const table = new Map<string, number>();
   'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
     .split('')

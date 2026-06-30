@@ -1,8 +1,11 @@
 import { bytesToHex } from '../kryptos/bytes.ts';
 import {
   exportEntriesBase64,
+  exportEntriesBase64Async,
   importEntriesBase64,
+  importEntriesBase64Async,
   mergeEntries,
+  normalizedIdentityKey,
   validateEntry,
   type AccountEntry,
 } from '../kryptos/manager.ts';
@@ -34,7 +37,7 @@ export function accountEntryToVaultEntry(entry: AccountEntry): VaultEntry {
 }
 
 export function identityKey(entry: Pick<VaultEntry, 'webname' | 'username'>): string {
-  return `${entry.webname.trim().toLowerCase()}\u0000${entry.username.trim().toLowerCase()}`;
+  return normalizedIdentityKey(entry);
 }
 
 export function validateVaultState(value: unknown): VaultState {
@@ -72,10 +75,11 @@ export function validateVaultState(value: unknown): VaultState {
     autoLockMinutes: Math.max(1, Math.min(60, Number(rawSettings.autoLockMinutes) || defaultSettings.autoLockMinutes)),
     backgroundLockSeconds: Math.max(
       5,
-      Math.min(300, Number(rawSettings.backgroundLockSeconds) || defaultSettings.backgroundLockSeconds),
+      Math.min(30, Number(rawSettings.backgroundLockSeconds) || defaultSettings.backgroundLockSeconds),
     ),
     preventScreenshots: Boolean(rawSettings.preventScreenshots),
     importMode: rawSettings.importMode === 'replace' ? 'replace' : 'merge',
+    hasStoredPrefix: Boolean(rawSettings.hasStoredPrefix),
   };
   return {
     version: 1,
@@ -128,10 +132,22 @@ export function exportVaultForBackup(
   nonce: Uint8Array,
   options: KryptosCipherOptions = {},
 ): string {
-  if (backupPassword.trim().length < 8) {
-    throw new Error('Backup password must be at least 8 characters.');
+  if (backupPassword.length === 0) {
+    throw new Error('Backup password is required for encrypted backup.');
   }
   return exportEntriesBase64(entries.map(vaultEntryToAccountEntry), backupPassword, nonce, options);
+}
+
+export async function exportVaultForBackupAsync(
+  entries: readonly VaultEntry[],
+  backupPassword: string,
+  nonce: Uint8Array,
+  options: KryptosCipherOptions = {},
+): Promise<string> {
+  if (backupPassword.length === 0) {
+    throw new Error('Backup password is required for encrypted backup.');
+  }
+  return exportEntriesBase64Async(entries.map(vaultEntryToAccountEntry), backupPassword, nonce, options);
 }
 
 export function importVaultBackup(
@@ -141,10 +157,35 @@ export function importVaultBackup(
   mode: 'merge' | 'replace',
   options: KryptosCipherOptions = {},
 ): VaultEntry[] {
-  if (backupPassword.trim().length < 8) {
-    throw new Error('Backup password must be at least 8 characters.');
+  if (backupPassword.length === 0) {
+    throw new Error('Backup password is required for encrypted backup.');
   }
   const incomingAccounts = importEntriesBase64(base64, backupPassword, options);
+  if (mode === 'replace') {
+    return incomingAccounts.map(accountEntryToVaultEntry);
+  }
+  const currentAccounts = current.map(vaultEntryToAccountEntry);
+  const resultAccounts = mergeEntries(currentAccounts, incomingAccounts);
+  return resultAccounts.map((entry) => {
+    const existing = current.find(
+      (currentEntry) =>
+        identityKey(currentEntry) === identityKey(entry),
+    );
+    return existing ?? accountEntryToVaultEntry(entry);
+  });
+}
+
+export async function importVaultBackupAsync(
+  base64: string,
+  backupPassword: string,
+  current: readonly VaultEntry[],
+  mode: 'merge' | 'replace',
+  options: KryptosCipherOptions = {},
+): Promise<VaultEntry[]> {
+  if (backupPassword.length === 0) {
+    throw new Error('Backup password is required for encrypted backup.');
+  }
+  const incomingAccounts = await importEntriesBase64Async(base64, backupPassword, options);
   if (mode === 'replace') {
     return incomingAccounts.map(accountEntryToVaultEntry);
   }

@@ -10,9 +10,7 @@ import { base64ToBytes, bytesToBase64 } from '../kryptos/bytes.ts';
 import { assertMobileAuthenticationAvailable } from './authPolicy.ts';
 
 const secureStoreOptions: SecureStore.SecureStoreOptions = {
-  requireAuthentication: true,
   keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
-  authenticationPrompt: 'Unlock Kryptos Mobile vault',
 };
 
 export const isWeb = Platform.OS === 'web';
@@ -52,19 +50,31 @@ export async function deleteSecureItem(key: string): Promise<void> {
   await SecureStore.deleteItemAsync(key, secureStoreOptions);
 }
 
-export async function authenticateVault(): Promise<boolean> {
+export async function assertVaultAuthenticationAvailable(): Promise<void> {
+  if (isWeb) {
+    return;
+  }
+  const securityLevel = await LocalAuthentication.getEnrolledLevelAsync();
+  assertMobileAuthenticationAvailable(securityLevel);
+}
+
+export async function promptVaultAuthentication(): Promise<boolean> {
   if (isWeb) {
     return true;
   }
-  const compatible = await LocalAuthentication.hasHardwareAsync();
-  const enrolled = await LocalAuthentication.isEnrolledAsync();
-  assertMobileAuthenticationAvailable(compatible, enrolled);
+  await assertVaultAuthenticationAvailable();
   const result = await LocalAuthentication.authenticateAsync({
     promptMessage: 'Unlock Kryptos Mobile',
+    promptDescription: 'Confirm this action with your device security.',
     cancelLabel: 'Cancel',
     disableDeviceFallback: false,
+    biometricsSecurityLevel: 'weak',
   });
   return result.success;
+}
+
+export async function authenticateVault(): Promise<boolean> {
+  return promptVaultAuthentication();
 }
 
 export async function readVaultBlob(): Promise<Uint8Array | null> {
@@ -108,6 +118,10 @@ export async function clearVaultBlob(): Promise<void> {
 
 export async function copyToClipboard(value: string): Promise<void> {
   await Clipboard.setStringAsync(value);
+}
+
+export async function readClipboardText(): Promise<string> {
+  return Clipboard.getStringAsync();
 }
 
 export async function clearClipboardIfUnchanged(value: string): Promise<void> {

@@ -1,8 +1,7 @@
-export function assertMobileAuthenticationAvailable(hasHardware: boolean, isEnrolled: boolean): void {
-  if (!hasHardware) {
-    throw new Error('System authentication hardware is required to unlock the vault on mobile.');
-  }
-  if (!isEnrolled) {
-    throw new Error('Set up biometric or device authentication before unlocking the vault.');
+export const MIN_DEVICE_AUTH_SECURITY_LEVEL = 1;
+
+export function assertMobileAuthenticationAvailable(securityLevel: number): void {
+  if (securityLevel < MIN_DEVICE_AUTH_SECURITY_LEVEL) {
+    throw new Error('Set up a device lock, fingerprint, or face unlock before using the vault on mobile.');
   }
 }

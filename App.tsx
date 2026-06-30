@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AppState,
+  KeyboardAvoidingView,
+  PanResponder,
+  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -8,33 +11,39 @@ import {
   Switch,
   Text,
   TextInput,
+  StatusBar as NativeStatusBar,
   View,
 } from 'react-native';
-import { StatusBar } from 'expo-status-bar';
+import { StatusBar as ExpoStatusBar } from 'expo-status-bar';
 
-import { generateEntryPassword } from './src/kryptos/manager.ts';
+import { generateEntryPassword, validateEntry } from './src/kryptos/manager.ts';
 import {
   clearClipboardIfUnchanged,
   copyToClipboard,
+  authenticateVault,
   preventSensitiveScreenCapture,
   randomBytes,
+  readClipboardText,
   webSecurityNotice,
 } from './src/platform/runtime.ts';
 import {
   assertNoDuplicate,
   createVaultEntry,
-  exportVaultForBackup,
-  importVaultBackup,
+  exportVaultForBackupAsync,
+  importVaultBackupAsync,
+  readStoredPrefix,
   resetVault,
   saveVault,
+  saveStoredPrefix,
   unlockVault,
 } from './src/vault/store.ts';
-import { createPrefixSession, destroyPrefixSession, withPrefix, type PrefixSession } from './src/vault/session.ts';
 import { emptyVault, type VaultEntry, type VaultSettings, type VaultState } from './src/vault/types.ts';
 
 type Screen = 'unlock' | 'prefix' | 'home' | 'entry' | 'edit' | 'settings' | 'backup';
 
 const nowIso = () => new Date().toISOString();
+const waitForUi = () => new Promise<void>((resolve) => setTimeout(resolve, 50));
+const MAX_BACKUP_TEXT_CHARS = 2_000_000;
 
 function entryToGenerator(entry: VaultEntry) {
   return {
@@ -49,7 +58,6 @@ function entryToGenerator(entry: VaultEntry) {
 export default function App() {
   const [vault, setVault] = useState<VaultState>(emptyVault());
   const [screen, setScreen] = useState<Screen>('unlock');
-  const [session, setSession] = useState<PrefixSession | null>(null);
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [form, setForm] = useState({
@@ -65,10 +73,18 @@ export default function App() {
   const [backupText, setBackupText] = useState('');
   const [message, setMessage] = useState('');
   const [clearConfirm, setClearConfirm] = useState(false);
-  const [tick, setTick] = useState(Date.now());
+  const [recoveryClearConfirm, setRecoveryClearConfirm] = useState(false);
+  const [unlocking, setUnlocking] = useState(false);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [workingEntryId, setWorkingEntryId] = useState<string | null>(null);
+  const [swipedId, setSwipedId] = useState<string | null>(null);
   const backgroundAt = useRef<number | null>(null);
-  const sessionRef = useRef<PrefixSession | null>(null);
   const screenRef = useRef<Screen>('unlock');
+  const autoUnlockAttempted = useRef(false);
+  const unlockInFlight = useRef(false);
+  const backupInFlight = useRef(false);
+  const passwordActionInFlight = useRef(false);
+  const operationGeneration = useRef(0);
 
   const selectedEntry = useMemo(
     () => vault.entries.find((entry) => entry.id === selectedId) ?? null,
@@ -85,26 +101,18 @@ export default function App() {
         entry.username.toLowerCase().includes(needle),
     );
   }, [query, vault.entries]);
-  const sessionMsLeft = session ? Math.max(0, session.expiresAt - tick) : 0;
   const notice = webSecurityNotice();
 
   useEffect(() => {
-    const timer = setInterval(() => setTick(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
-    if (session && sessionMsLeft <= 0) {
-      lockPrefixOnly('Prefix session expired.');
-    }
-  }, [session, sessionMsLeft]);
-
-  useEffect(() => {
-    sessionRef.current = session;
-  }, [session]);
-
-  useEffect(() => {
     screenRef.current = screen;
+  }, [screen]);
+
+  useEffect(() => {
+    if (screen !== 'unlock' || autoUnlockAttempted.current) {
+      return;
+    }
+    autoUnlockAttempted.current = true;
+    void unlock();
   }, [screen]);
 
   useEffect(() => {
@@ -122,7 +130,7 @@ export default function App() {
         const elapsed = (Date.now() - backgroundAt.current) / 1000;
         backgroundAt.current = null;
         if (elapsed >= vault.settings.backgroundLockSeconds && screenRef.current !== 'unlock') {
-          lockAll('Locked after background timeout.');
+          lockAll('Locked after background timeout.', true);
         }
       }
     });
@@ -130,17 +138,12 @@ export default function App() {
   }, [vault.settings.backgroundLockSeconds]);
 
   function noteActivity(): void {
-    const current = sessionRef.current;
-    if (!current) {
-      return;
-    }
-    const expiresAt = Date.now() + vault.settings.autoLockMinutes * 60 * 1000;
-    if (expiresAt - current.expiresAt < 1000) {
-      return;
-    }
-    const next = { ...current, expiresAt };
-    sessionRef.current = next;
-    setSession(next);
+    // Activity no longer extends a prefix session; sensitive operations prompt
+    // system authentication when they need the stored prefix.
+  }
+
+  function isCurrentOperation(token: number): boolean {
+    return token === operationGeneration.current && screenRef.current !== 'unlock';
   }
 
   function updateQuery(value: string): void {
@@ -158,56 +161,67 @@ export default function App() {
     setBackupPassword(value);
   }
 
-  function updateBackupText(value: string): void {
-    noteActivity();
-    setBackupText(value);
-  }
-
   async function persist(next: VaultState): Promise<void> {
     await saveVault(next);
     setVault(next);
   }
 
   async function unlock(): Promise<void> {
+    if (unlockInFlight.current) {
+      return;
+    }
+    unlockInFlight.current = true;
+    setUnlocking(true);
+    setMessage('Waiting for system authentication...');
     try {
       const next = await unlockVault();
-      setVault(next);
-      setScreen('prefix');
-      setMessage(next.entries.length === 0 ? 'Vault ready. Add your first entry after starting a prefix session.' : 'Vault unlocked.');
+      const storedPrefix = await readStoredPrefix();
+      const hasStoredPrefix = storedPrefix !== null;
+      const syncedVault =
+        next.settings.hasStoredPrefix === hasStoredPrefix
+          ? next
+          : { ...next, settings: { ...next.settings, hasStoredPrefix } };
+      if (syncedVault !== next) {
+        await saveVault(syncedVault);
+      }
+      setVault(syncedVault);
+      setRecoveryClearConfirm(false);
+      setScreen(hasStoredPrefix ? 'home' : 'prefix');
+      setMessage(
+        hasStoredPrefix
+          ? 'Vault unlocked. Tap an entry to copy after system authentication.'
+          : 'Vault ready. Save a prefix for this device; empty is allowed.',
+      );
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Unable to unlock vault.');
+    } finally {
+      unlockInFlight.current = false;
+      setUnlocking(false);
     }
   }
 
-  async function startPrefixSession(): Promise<void> {
+  async function savePrefixForDevice(): Promise<void> {
     try {
-      if (prefixInput.length === 0) {
-        throw new Error('Master prefix is required for this session.');
+      setMessage('Authenticate to save the device prefix...');
+      const authenticated = await authenticateVault();
+      if (!authenticated) {
+        setMessage('Prefix save cancelled.');
+        return;
       }
-      const next = await createPrefixSession(prefixInput, vault.settings.autoLockMinutes * 60 * 1000);
-      destroyPrefixSession(session);
-      setSession(next);
+      await saveStoredPrefix(prefixInput);
+      const next = { ...vault, settings: { ...vault.settings, hasStoredPrefix: true } };
+      await persist(next);
       setPrefixInput('');
       setScreen('home');
-      setMessage('Prefix session started. The prefix is encrypted in memory only.');
+      setMessage(prefixInput.length === 0 ? 'Empty prefix saved. System authentication is still required for each password action.' : 'Prefix saved locally. System authentication is required for each password action.');
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Unable to start prefix session.');
+      setMessage(error instanceof Error ? error.message : 'Unable to save prefix.');
     }
   }
 
-  function lockPrefixOnly(nextMessage = 'Prefix session cleared.'): void {
-    destroyPrefixSession(session);
-    setSession(null);
-    setPrefixInput('');
-    setGeneratedPassword(null);
-    setPasswordVisible(false);
-    setScreen('prefix');
-    setMessage(nextMessage);
-  }
-
-  function lockAll(nextMessage = 'Vault locked.'): void {
-    destroyPrefixSession(session);
-    setSession(null);
+  function lockAll(nextMessage = 'Vault locked.', autoUnlock = false): void {
+    operationGeneration.current += 1;
+    autoUnlockAttempted.current = !autoUnlock;
     setVault(emptyVault());
     setPrefixInput('');
     setGeneratedPassword(null);
@@ -216,7 +230,9 @@ export default function App() {
     setBackupText('');
     setQuery('');
     setSelectedId(null);
+    setSwipedId(null);
     setClearConfirm(false);
+    setRecoveryClearConfirm(false);
     setScreen('unlock');
     setMessage(nextMessage);
   }
@@ -258,6 +274,7 @@ export default function App() {
         charsetPreset: form.charsetPreset,
         updatedAt: nowIso(),
       };
+      validateEntry(entryToGenerator(updated));
       assertNoDuplicate(vault.entries, updated, selectedEntry?.id);
       const entries = selectedEntry
         ? vault.entries.map((entry) => (entry.id === selectedEntry.id ? updated : entry))
@@ -287,13 +304,28 @@ export default function App() {
 
   async function generateFor(entry: VaultEntry, reveal = false): Promise<void> {
     noteActivity();
-    if (!session) {
-      setScreen('prefix');
-      setMessage('Start a prefix session first.');
+    if (passwordActionInFlight.current) {
+      setMessage('Finish the current authentication first.');
       return;
     }
+    passwordActionInFlight.current = true;
+    setWorkingEntryId(entry.id);
+    setMessage('Authenticate to reveal password...');
     try {
-      const password = await withPrefix(session, (prefix) => generateEntryPassword(entryToGenerator(entry), prefix));
+      const authenticated = await authenticateVault();
+      if (!authenticated) {
+        setMessage('Password action cancelled.');
+        return;
+      }
+      const prefix = await readStoredPrefix();
+      if (prefix === null) {
+        const next = { ...vault, settings: { ...vault.settings, hasStoredPrefix: false } };
+        await persist(next);
+        setScreen('prefix');
+        setMessage('Save a prefix on this device first. Empty is allowed.');
+        return;
+      }
+      const password = generateEntryPassword(entryToGenerator(entry), prefix);
       setGeneratedPassword(password);
       setPasswordVisible(reveal);
       if (reveal) {
@@ -305,54 +337,174 @@ export default function App() {
         setGeneratedPassword(null);
       }
     } catch (error) {
-      lockPrefixOnly(error instanceof Error ? error.message : 'Prefix session expired.');
+      setMessage(error instanceof Error ? error.message : 'Unable to generate password.');
+    } finally {
+      passwordActionInFlight.current = false;
+      setWorkingEntryId(null);
     }
   }
 
   async function copyPassword(entry: VaultEntry): Promise<void> {
     noteActivity();
-    if (!session) {
-      setScreen('prefix');
-      setMessage('Start a prefix session first.');
+    if (passwordActionInFlight.current) {
+      setMessage('Finish the current authentication first.');
       return;
     }
+    passwordActionInFlight.current = true;
+    setWorkingEntryId(entry.id);
+    setMessage(`Authenticate to copy ${entry.webname}...`);
     try {
-      const password = await withPrefix(session, (prefix) => generateEntryPassword(entryToGenerator(entry), prefix));
+      const authenticated = await authenticateVault();
+      if (!authenticated) {
+        setMessage('Password action cancelled.');
+        return;
+      }
+      const prefix = await readStoredPrefix();
+      if (prefix === null) {
+        const next = { ...vault, settings: { ...vault.settings, hasStoredPrefix: false } };
+        await persist(next);
+        setScreen('prefix');
+        setMessage('Save a prefix on this device first. Empty is allowed.');
+        return;
+      }
+      const password = generateEntryPassword(entryToGenerator(entry), prefix);
       await copyToClipboard(password);
       setGeneratedPassword(null);
       setPasswordVisible(false);
-      setMessage('Password copied. Clipboard will be cleared in 30 seconds if unchanged.');
+      setMessage(`Copied ${entry.webname}. Clipboard will be cleared in 30 seconds if unchanged.`);
       setTimeout(() => clearClipboardIfUnchanged(password), 30000);
     } catch (error) {
-      lockPrefixOnly(error instanceof Error ? error.message : 'Prefix session expired.');
+      setMessage(error instanceof Error ? error.message : 'Unable to copy password.');
+    } finally {
+      passwordActionInFlight.current = false;
+      setWorkingEntryId(null);
     }
   }
 
   async function exportBackup(): Promise<void> {
     noteActivity();
+    if (backupInFlight.current) {
+      return;
+    }
+    const token = operationGeneration.current;
+    backupInFlight.current = true;
+    setBackupBusy(true);
+    setMessage('Authenticate to export encrypted backup metadata...');
     try {
+      const authenticated = await authenticateVault();
+      if (!authenticated) {
+        setMessage('Backup export cancelled.');
+        return;
+      }
+      if (!isCurrentOperation(token)) {
+        return;
+      }
+      setMessage('Encrypting backup. This can take a moment, but the UI should stay responsive.');
+      await waitForUi();
       const nonce = await randomBytes(16);
-      const exported = exportVaultForBackup(vault.entries, backupPassword, nonce);
+      const exported = await exportVaultForBackupAsync(vault.entries, backupPassword, nonce);
+      if (!isCurrentOperation(token)) {
+        return;
+      }
       setBackupText(exported);
       setBackupPassword('');
-      setMessage('Encrypted backup generated.');
+      await copyToClipboard(exported);
+      if (!isCurrentOperation(token)) {
+        return;
+      }
+      setMessage(`Encrypted backup generated and copied to clipboard (${exported.length} characters).`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Unable to export backup.');
+    } finally {
+      backupInFlight.current = false;
+      setBackupBusy(false);
     }
   }
 
   async function importBackup(): Promise<void> {
     noteActivity();
+    if (backupInFlight.current) {
+      return;
+    }
+    const token = operationGeneration.current;
+    const incomingText = backupText.trim();
+    if (incomingText.length > MAX_BACKUP_TEXT_CHARS) {
+      setMessage('Backup text is too large for mobile import. Use a smaller encrypted backup.');
+      return;
+    }
+    backupInFlight.current = true;
+    setBackupBusy(true);
+    setMessage('Authenticate to import encrypted backup metadata...');
     try {
-      const entries = importVaultBackup(backupText.trim(), backupPassword, vault.entries, vault.settings.importMode);
-      await persist({ ...vault, entries });
+      const authenticated = await authenticateVault();
+      if (!authenticated) {
+        setMessage('Backup import cancelled.');
+        return;
+      }
+      if (!isCurrentOperation(token)) {
+        return;
+      }
+      setMessage('Decrypting and validating backup. Existing data will not change unless this succeeds.');
+      await waitForUi();
+      const entries = await importVaultBackupAsync(incomingText, backupPassword, vault.entries, vault.settings.importMode);
+      if (!isCurrentOperation(token)) {
+        return;
+      }
+      const next = { ...vault, entries };
+      await saveVault(next);
+      if (!isCurrentOperation(token)) {
+        return;
+      }
+      setVault(next);
       setBackupPassword('');
       setBackupText('');
-      setMessage('Backup imported.');
+      setMessage(`Backup imported. Vault now has ${entries.length} entries.`);
       setScreen('home');
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Unable to import backup.');
+    } finally {
+      backupInFlight.current = false;
+      setBackupBusy(false);
     }
+  }
+
+  async function pasteBackupFromClipboard(): Promise<void> {
+    if (backupInFlight.current) {
+      return;
+    }
+    try {
+      const text = (await readClipboardText()).trim();
+      if (text.length === 0) {
+        setMessage('Clipboard does not contain backup text.');
+        return;
+      }
+      if (text.length > MAX_BACKUP_TEXT_CHARS) {
+        setMessage('Clipboard backup text is too large for mobile import.');
+        return;
+      }
+      setBackupText(text);
+      setMessage(`Backup loaded from clipboard (${text.length} characters).`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Unable to read clipboard.');
+    }
+  }
+
+  async function copyBackupToClipboard(): Promise<void> {
+    if (backupText.length === 0) {
+      setMessage('No backup text is loaded.');
+      return;
+    }
+    try {
+      await copyToClipboard(backupText);
+      setMessage(`Backup copied to clipboard (${backupText.length} characters).`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Unable to copy backup.');
+    }
+  }
+
+  function clearBackupText(): void {
+    setBackupText('');
+    setMessage('Backup text cleared from this screen.');
   }
 
   async function updateSettings(settings: Partial<VaultSettings>): Promise<void> {
@@ -379,21 +531,43 @@ export default function App() {
     }
   }
 
+  async function clearLocalDataFromUnlock(): Promise<void> {
+    if (!recoveryClearConfirm) {
+      setRecoveryClearConfirm(true);
+      setMessage('Tap Confirm clear on this screen to permanently delete the local vault and device key.');
+      return;
+    }
+    try {
+      await resetVault();
+      setVault(emptyVault());
+      setRecoveryClearConfirm(false);
+      autoUnlockAttempted.current = true;
+      setMessage('Local vault data cleared. Retry unlock to create a fresh vault, then import an encrypted backup if needed.');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Unable to clear local vault data.');
+    }
+  }
+
   return (
     <SafeAreaView style={styles.safe} onTouchStart={noteActivity}>
-      <StatusBar style="dark" />
+      <ExpoStatusBar style="dark" backgroundColor="#f5f7fb" translucent={false} />
       <View style={styles.shell}>
-        <Header screen={screen} sessionMsLeft={sessionMsLeft} onLock={() => lockAll()} />
+        <Header screen={screen} onLock={() => lockAll()} />
         {notice ? <Text style={styles.notice}>{notice}</Text> : null}
         {message ? <Text style={styles.message}>{message}</Text> : null}
 
         {screen === 'unlock' ? (
-          <UnlockScreen onUnlock={unlock} />
+          <UnlockScreen
+            onUnlock={unlock}
+            unlocking={unlocking}
+            onClearLocalData={clearLocalDataFromUnlock}
+            clearConfirm={recoveryClearConfirm}
+          />
         ) : screen === 'prefix' ? (
           <PrefixScreen
             prefix={prefixInput}
             onPrefixChange={setPrefixInput}
-            onStart={startPrefixSession}
+            onSave={savePrefixForDevice}
             onLock={() => lockAll()}
           />
         ) : screen === 'home' ? (
@@ -401,12 +575,18 @@ export default function App() {
             query={query}
             onQueryChange={updateQuery}
             entries={filteredEntries}
-            onOpen={(entry) => {
+            workingEntryId={workingEntryId}
+            passwordBusy={passwordActionInFlight.current}
+            swipedId={swipedId}
+            onSwipe={setSwipedId}
+            onCopy={copyPassword}
+            onDetails={(entry) => {
               setSelectedId(entry.id);
               setGeneratedPassword(null);
               setPasswordVisible(false);
               setScreen('entry');
             }}
+            onDelete={deleteEntry}
             onCreate={openCreate}
             onBackup={() => {
               setBackupPassword('');
@@ -414,13 +594,13 @@ export default function App() {
               setScreen('backup');
             }}
             onSettings={() => setScreen('settings')}
-            onPrefix={() => setScreen('prefix')}
           />
         ) : screen === 'entry' && selectedEntry ? (
           <EntryScreen
             entry={selectedEntry}
             generatedPassword={generatedPassword}
             passwordVisible={passwordVisible}
+            working={workingEntryId === selectedEntry.id}
             onGenerate={() => generateFor(selectedEntry, true)}
             onCopy={() => copyPassword(selectedEntry)}
             onEdit={() => openEdit(selectedEntry)}
@@ -441,9 +621,12 @@ export default function App() {
             backupPassword={backupPassword}
             backupText={backupText}
             onPasswordChange={updateBackupPassword}
-            onTextChange={updateBackupText}
             onExport={exportBackup}
             onImport={importBackup}
+            onPaste={pasteBackupFromClipboard}
+            onCopyBackup={copyBackupToClipboard}
+            onClearBackup={clearBackupText}
+            busy={backupBusy}
             onBack={() => {
               setBackupPassword('');
               setBackupText('');
@@ -454,6 +637,10 @@ export default function App() {
           <SettingsScreen
             settings={vault.settings}
             onChange={updateSettings}
+            onPrefix={() => {
+              setPrefixInput('');
+              setScreen('prefix');
+            }}
             onClear={clearAllData}
             clearConfirm={clearConfirm}
             onBack={() => setScreen('home')}
@@ -466,25 +653,25 @@ export default function App() {
 
 function Header({
   screen,
-  sessionMsLeft,
   onLock,
 }: {
   screen: Screen;
-  sessionMsLeft: number;
   onLock: () => void;
 }) {
-  const minutes = Math.floor(sessionMsLeft / 60000);
-  const seconds = Math.floor((sessionMsLeft % 60000) / 1000);
   return (
     <View style={styles.header}>
-      <View>
+      <View style={styles.headerText}>
         <Text style={styles.title}>Kryptos</Text>
-        <Text style={styles.subtitle}>
-          {sessionMsLeft > 0 ? `Prefix session ${minutes}:${String(seconds).padStart(2, '0')}` : 'Zero-stored passwords'}
+        <Text style={styles.subtitle} numberOfLines={1} ellipsizeMode="tail">
+          {screen === 'unlock' ? 'Encrypted local vault' : 'System-auth gated password actions'}
         </Text>
       </View>
       {screen !== 'unlock' ? (
-        <Pressable style={styles.iconButton} onPress={onLock}>
+        <Pressable
+          style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}
+          onPress={onLock}
+          android_ripple={{ color: 'rgba(255,255,255,0.18)' }}
+        >
           <Text style={styles.iconButtonText}>Lock</Text>
         </Pressable>
       ) : null}
@@ -492,42 +679,65 @@ function Header({
   );
 }
 
-function UnlockScreen({ onUnlock }: { onUnlock: () => void }) {
+function UnlockScreen({
+  onUnlock,
+  unlocking,
+  onClearLocalData,
+  clearConfirm,
+}: {
+  onUnlock: () => void;
+  unlocking: boolean;
+  onClearLocalData: () => void;
+  clearConfirm: boolean;
+}) {
   return (
-    <View style={styles.center}>
-      <Text style={styles.panelTitle}>Encrypted vault</Text>
-      <Text style={styles.bodyText}>Unlock local metadata with the system security prompt. Passwords and prefix are not stored.</Text>
-      <PrimaryButton label="Unlock vault" onPress={onUnlock} />
-    </View>
+    <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.flex}>
+      <ScrollView contentContainerStyle={styles.center} keyboardShouldPersistTaps="handled">
+        <Text style={styles.panelTitle}>Encrypted vault</Text>
+        <Text style={styles.bodyText}>
+          {unlocking
+            ? 'Waiting for the system security prompt. Passwords are never stored; the prefix is protected by system authentication.'
+            : 'Unlock local metadata with the system security prompt. Passwords are never stored; the prefix is protected by system authentication.'}
+        </Text>
+        <PrimaryButton label={unlocking ? 'Unlocking...' : 'Retry unlock'} onPress={onUnlock} disabled={unlocking} />
+        <DangerButton
+          label={clearConfirm ? 'Confirm clear' : 'Clear local vault'}
+          onPress={onClearLocalData}
+          disabled={unlocking}
+        />
+      </ScrollView>
+    </KeyboardAvoidingView>
   );
 }
 
 function PrefixScreen({
   prefix,
   onPrefixChange,
-  onStart,
+  onSave,
   onLock,
 }: {
   prefix: string;
   onPrefixChange: (value: string) => void;
-  onStart: () => void;
+  onSave: () => void;
   onLock: () => void;
 }) {
   return (
-    <View style={styles.center}>
-      <Text style={styles.panelTitle}>Master prefix</Text>
-      <Text style={styles.bodyText}>The prefix is encrypted in memory for this session only. It is cleared on timeout, background lock, or manual lock.</Text>
-      <TextInput
-        value={prefix}
-        onChangeText={onPrefixChange}
-        secureTextEntry
-        placeholder="Enter master prefix"
-        placeholderTextColor="#7b8494"
-        style={styles.input}
-      />
-      <PrimaryButton label="Start session" onPress={onStart} />
-      <SecondaryButton label="Lock vault" onPress={onLock} />
-    </View>
+    <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.flex}>
+      <ScrollView contentContainerStyle={styles.center} keyboardShouldPersistTaps="handled">
+        <Text style={styles.panelTitle}>Device prefix</Text>
+        <Text style={styles.bodyText}>The prefix is encrypted locally with system authentication. Empty is allowed; use a non-empty prefix for stronger generated passwords.</Text>
+        <TextInput
+          value={prefix}
+          onChangeText={onPrefixChange}
+          secureTextEntry
+          placeholder="Master prefix (empty allowed)"
+          placeholderTextColor="#7b8494"
+          style={styles.input}
+        />
+        <PrimaryButton label={prefix.length === 0 ? 'Save empty prefix' : 'Save prefix'} onPress={onSave} />
+        <SecondaryButton label="Lock vault" onPress={onLock} />
+      </ScrollView>
+    </KeyboardAvoidingView>
   );
 }
 
@@ -535,27 +745,36 @@ function HomeScreen({
   query,
   onQueryChange,
   entries,
-  onOpen,
+  workingEntryId,
+  passwordBusy,
+  swipedId,
+  onSwipe,
+  onCopy,
+  onDetails,
+  onDelete,
   onCreate,
   onBackup,
   onSettings,
-  onPrefix,
 }: {
   query: string;
   onQueryChange: (value: string) => void;
   entries: VaultEntry[];
-  onOpen: (entry: VaultEntry) => void;
+  workingEntryId: string | null;
+  passwordBusy: boolean;
+  swipedId: string | null;
+  onSwipe: (id: string | null) => void;
+  onCopy: (entry: VaultEntry) => void;
+  onDetails: (entry: VaultEntry) => void;
+  onDelete: (entry: VaultEntry) => void;
   onCreate: () => void;
   onBackup: () => void;
   onSettings: () => void;
-  onPrefix: () => void;
 }) {
   return (
     <View style={styles.flex}>
       <View style={styles.toolbar}>
         <PrimaryButton label="Add" onPress={onCreate} compact />
         <SecondaryButton label="Backup" onPress={onBackup} compact />
-        <SecondaryButton label="Prefix" onPress={onPrefix} compact />
         <SecondaryButton label="Settings" onPress={onSettings} compact />
       </View>
       <TextInput
@@ -567,19 +786,84 @@ function HomeScreen({
       />
       <ScrollView style={styles.list} contentContainerStyle={styles.listContent}>
         {entries.length === 0 ? (
-          <Text style={styles.empty}>No entries yet.</Text>
+          <Text style={styles.empty}>No entries yet. Add one, or import an encrypted backup from the Backup screen.</Text>
         ) : (
           entries.map((entry) => (
-            <Pressable key={entry.id} style={styles.row} onPress={() => onOpen(entry)}>
-              <View style={styles.rowMain}>
-                <Text style={styles.rowTitle}>{entry.webname}</Text>
-                <Text style={styles.rowSub}>{entry.username}</Text>
-              </View>
-              <Text style={styles.meta}>{entry.length} / {entry.charsetPreset}</Text>
-            </Pressable>
+            <VaultRow
+              key={entry.id}
+              entry={entry}
+              revealed={swipedId === entry.id}
+              working={workingEntryId === entry.id}
+              disabled={passwordBusy}
+              onSwipe={onSwipe}
+              onCopy={onCopy}
+              onDetails={onDetails}
+              onDelete={onDelete}
+            />
           ))
         )}
       </ScrollView>
+    </View>
+  );
+}
+
+function VaultRow({
+  entry,
+  revealed,
+  working,
+  disabled,
+  onSwipe,
+  onCopy,
+  onDetails,
+  onDelete,
+}: {
+  entry: VaultEntry;
+  revealed: boolean;
+  working: boolean;
+  disabled: boolean;
+  onSwipe: (id: string | null) => void;
+  onCopy: (entry: VaultEntry) => void;
+  onDetails: (entry: VaultEntry) => void;
+  onDelete: (entry: VaultEntry) => void;
+}) {
+  const responder = useMemo(
+    () =>
+      PanResponder.create({
+        onMoveShouldSetPanResponder: (_, gesture) =>
+          Math.abs(gesture.dx) > 24 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.4,
+        onPanResponderRelease: (_, gesture) => {
+          if (gesture.dx < -48) {
+            onSwipe(entry.id);
+          } else if (gesture.dx > 36) {
+            onSwipe(null);
+          }
+        },
+      }),
+    [entry.id, onSwipe],
+  );
+
+  return (
+    <View style={styles.rowWrap} {...responder.panHandlers}>
+      <Pressable
+        style={({ pressed }) => [styles.row, pressed && styles.pressed, (working || disabled) && styles.rowWorking]}
+        onPress={() => onCopy(entry)}
+        onLongPress={() => onDetails(entry)}
+        disabled={working || disabled}
+      >
+        <View style={styles.rowMain}>
+          <Text style={styles.rowTitle} numberOfLines={1} ellipsizeMode="tail">{entry.webname}</Text>
+          <Text style={styles.rowSub} numberOfLines={1} ellipsizeMode="tail">
+            {working ? 'Authenticating...' : disabled ? 'Wait for current action...' : entry.username}
+          </Text>
+        </View>
+        <Text style={styles.meta} numberOfLines={1}>{entry.length} / {entry.charsetPreset}</Text>
+      </Pressable>
+      {revealed ? (
+        <View style={styles.rowActions}>
+          <SecondaryButton label="Details" onPress={() => onDetails(entry)} compact />
+          <DangerButton label="Delete" onPress={() => onDelete(entry)} compact />
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -588,6 +872,7 @@ function EntryScreen({
   entry,
   generatedPassword,
   passwordVisible,
+  working,
   onGenerate,
   onCopy,
   onEdit,
@@ -597,6 +882,7 @@ function EntryScreen({
   entry: VaultEntry;
   generatedPassword: string | null;
   passwordVisible: boolean;
+  working: boolean;
   onGenerate: () => void;
   onCopy: () => void;
   onEdit: () => void;
@@ -604,7 +890,7 @@ function EntryScreen({
   onBack: () => void;
 }) {
   return (
-    <View style={styles.flex}>
+    <ScrollView style={styles.flex} contentContainerStyle={styles.entryContent}>
       <SecondaryButton label="Back" onPress={onBack} compact />
       <View style={styles.detail}>
         <Text style={styles.panelTitle}>{entry.webname}</Text>
@@ -617,12 +903,12 @@ function EntryScreen({
         </View>
       </View>
       <View style={styles.toolbar}>
-        <PrimaryButton label="Show" onPress={onGenerate} compact />
-        <PrimaryButton label="Copy" onPress={onCopy} compact />
-        <SecondaryButton label="Edit" onPress={onEdit} compact />
-        <DangerButton label="Delete" onPress={onDelete} compact />
+        <PrimaryButton label={working ? 'Working...' : 'Show'} onPress={onGenerate} compact disabled={working} />
+        <PrimaryButton label="Copy" onPress={onCopy} compact disabled={working} />
+        <SecondaryButton label="Edit" onPress={onEdit} compact disabled={working} />
+        <DangerButton label="Delete" onPress={onDelete} compact disabled={working} />
       </View>
-    </View>
+    </ScrollView>
   );
 }
 
@@ -647,14 +933,24 @@ function EditScreen({
       <Field label="Length" value={form.length} keyboardType="number-pad" onChangeText={(length) => onChange({ ...form, length })} />
       <View style={styles.segment}>
         <Pressable
-          style={[styles.segmentItem, form.charsetPreset === 'full' && styles.segmentActive]}
+          style={({ pressed }) => [
+            styles.segmentItem,
+            form.charsetPreset === 'full' && styles.segmentActive,
+            pressed && styles.segmentPressed,
+          ]}
           onPress={() => onChange({ ...form, charsetPreset: 'full' })}
+          android_ripple={{ color: 'rgba(20,83,45,0.08)' }}
         >
           <Text style={styles.segmentText}>Full</Text>
         </Pressable>
         <Pressable
-          style={[styles.segmentItem, form.charsetPreset === 'alphanum' && styles.segmentActive]}
+          style={({ pressed }) => [
+            styles.segmentItem,
+            form.charsetPreset === 'alphanum' && styles.segmentActive,
+            pressed && styles.segmentPressed,
+          ]}
           onPress={() => onChange({ ...form, charsetPreset: 'alphanum' })}
+          android_ripple={{ color: 'rgba(20,83,45,0.08)' }}
         >
           <Text style={styles.segmentText}>Alphanum</Text>
         </Pressable>
@@ -665,29 +961,48 @@ function EditScreen({
   );
 }
 
+function backupPreview(text: string): string {
+  if (text.length === 0) {
+    return 'No backup loaded. Export to copy one, or paste an encrypted backup from the clipboard before importing.';
+  }
+  const compact = text.replace(/\s+/g, '');
+  const head = compact.slice(0, 28);
+  const tail = compact.length > 56 ? compact.slice(-28) : '';
+  return tail.length > 0
+    ? `${compact.length} characters: ${head}...${tail}`
+    : `${compact.length} characters: ${head}`;
+}
+
 function BackupScreen({
   mode,
   backupPassword,
   backupText,
   onPasswordChange,
-  onTextChange,
   onExport,
   onImport,
+  onPaste,
+  onCopyBackup,
+  onClearBackup,
+  busy,
   onBack,
 }: {
   mode: 'merge' | 'replace';
   backupPassword: string;
   backupText: string;
   onPasswordChange: (value: string) => void;
-  onTextChange: (value: string) => void;
   onExport: () => void;
   onImport: () => void;
+  onPaste: () => void;
+  onCopyBackup: () => void;
+  onClearBackup: () => void;
+  busy: boolean;
   onBack: () => void;
 }) {
+  const hasBackupText = backupText.length > 0;
   return (
     <ScrollView style={styles.flex} contentContainerStyle={styles.form}>
       <Text style={styles.panelTitle}>Encrypted backup</Text>
-      <Text style={styles.bodyText}>Export/import uses KryptosCore Base64 format encrypted with a separate backup password. Import mode: {mode}.</Text>
+      <Text style={styles.bodyText}>Export/import uses KryptosCore Base64 format encrypted with a separate backup password. Export copies the backup to the clipboard; import reads backup text loaded from the clipboard. Import mode: {mode}.</Text>
       <TextInput
         value={backupPassword}
         onChangeText={onPasswordChange}
@@ -696,17 +1011,17 @@ function BackupScreen({
         placeholderTextColor="#7b8494"
         style={styles.input}
       />
-      <TextInput
-        value={backupText}
-        onChangeText={onTextChange}
-        multiline
-        placeholder="Encrypted Base64 backup"
-        placeholderTextColor="#7b8494"
-        style={[styles.input, styles.textArea]}
-      />
-      <PrimaryButton label="Export" onPress={onExport} />
-      <SecondaryButton label="Import" onPress={onImport} />
-      <SecondaryButton label="Back" onPress={onBack} />
+      <View style={styles.backupSummary}>
+        <Text style={styles.label}>Loaded backup</Text>
+        <Text style={styles.monoPreview} selectable>{backupPreview(backupText)}</Text>
+      </View>
+      {busy ? <Text style={styles.bodyText}>Working...</Text> : null}
+      <PrimaryButton label={busy ? 'Working...' : 'Export'} onPress={onExport} disabled={busy} />
+      <SecondaryButton label="Copy loaded backup" onPress={onCopyBackup} disabled={busy || !hasBackupText} />
+      <SecondaryButton label="Paste backup from clipboard" onPress={onPaste} disabled={busy} />
+      <SecondaryButton label="Import loaded backup" onPress={onImport} disabled={busy || !hasBackupText} />
+      <SecondaryButton label="Clear loaded backup" onPress={onClearBackup} disabled={busy || !hasBackupText} />
+      <SecondaryButton label="Back" onPress={onBack} disabled={busy} />
     </ScrollView>
   );
 }
@@ -714,12 +1029,14 @@ function BackupScreen({
 function SettingsScreen({
   settings,
   onChange,
+  onPrefix,
   onClear,
   clearConfirm,
   onBack,
 }: {
   settings: VaultSettings;
   onChange: (settings: Partial<VaultSettings>) => void;
+  onPrefix: () => void;
   onClear: () => void;
   clearConfirm: boolean;
   onBack: () => void;
@@ -741,19 +1058,13 @@ function SettingsScreen({
           onValueChange={(merge) => onChange({ importMode: merge ? 'merge' : 'replace' })}
         />
       </View>
-      <Text style={styles.label}>Auto lock minutes</Text>
-      <TextInput
-        value={String(settings.autoLockMinutes)}
-        keyboardType="number-pad"
-        style={styles.input}
-        onChangeText={(value) => onChange({ autoLockMinutes: Math.max(1, Number.parseInt(value, 10) || 1) })}
-      />
-      <Text style={styles.label}>Background lock seconds</Text>
+      <SecondaryButton label="Change prefix" onPress={onPrefix} />
+      <Text style={styles.label}>Background lock seconds (5-30)</Text>
       <TextInput
         value={String(settings.backgroundLockSeconds)}
         keyboardType="number-pad"
         style={styles.input}
-        onChangeText={(value) => onChange({ backgroundLockSeconds: Math.max(5, Number.parseInt(value, 10) || 30) })}
+        onChangeText={(value) => onChange({ backgroundLockSeconds: Math.max(5, Math.min(30, Number.parseInt(value, 10) || 30)) })}
       />
       <DangerButton label={clearConfirm ? 'Confirm clear' : 'Clear vault'} onPress={onClear} />
       <SecondaryButton label="Back" onPress={onBack} />
@@ -780,26 +1091,89 @@ function Field({
   );
 }
 
-function PrimaryButton({ label, onPress, compact = false }: { label: string; onPress: () => void; compact?: boolean }) {
+function PrimaryButton({
+  label,
+  onPress,
+  compact = false,
+  disabled = false,
+}: {
+  label: string;
+  onPress: () => void;
+  compact?: boolean;
+  disabled?: boolean;
+}) {
   return (
-    <Pressable style={[styles.button, styles.primaryButton, compact && styles.compactButton]} onPress={onPress}>
-      <Text style={styles.primaryText}>{label}</Text>
+    <Pressable
+      style={({ pressed }) => [
+        styles.button,
+        styles.primaryButton,
+        compact && styles.compactButton,
+        pressed && !disabled && styles.pressed,
+        disabled && styles.disabledButton,
+      ]}
+      onPress={onPress}
+      disabled={disabled}
+      android_ripple={{ color: 'rgba(255,255,255,0.18)' }}
+    >
+      <Text style={styles.primaryText} numberOfLines={1} adjustsFontSizeToFit>{label}</Text>
     </Pressable>
   );
 }
 
-function SecondaryButton({ label, onPress, compact = false }: { label: string; onPress: () => void; compact?: boolean }) {
+function SecondaryButton({
+  label,
+  onPress,
+  compact = false,
+  disabled = false,
+}: {
+  label: string;
+  onPress: () => void;
+  compact?: boolean;
+  disabled?: boolean;
+}) {
   return (
-    <Pressable style={[styles.button, styles.secondaryButton, compact && styles.compactButton]} onPress={onPress}>
-      <Text style={styles.secondaryText}>{label}</Text>
+    <Pressable
+      style={({ pressed }) => [
+        styles.button,
+        styles.secondaryButton,
+        compact && styles.compactButton,
+        pressed && !disabled && styles.pressed,
+        disabled && styles.disabledButton,
+      ]}
+      onPress={onPress}
+      disabled={disabled}
+      android_ripple={{ color: 'rgba(17,24,39,0.08)' }}
+    >
+      <Text style={styles.secondaryText} numberOfLines={1} adjustsFontSizeToFit>{label}</Text>
     </Pressable>
   );
 }
 
-function DangerButton({ label, onPress, compact = false }: { label: string; onPress: () => void; compact?: boolean }) {
+function DangerButton({
+  label,
+  onPress,
+  compact = false,
+  disabled = false,
+}: {
+  label: string;
+  onPress: () => void;
+  compact?: boolean;
+  disabled?: boolean;
+}) {
   return (
-    <Pressable style={[styles.button, styles.dangerButton, compact && styles.compactButton]} onPress={onPress}>
-      <Text style={styles.dangerText}>{label}</Text>
+    <Pressable
+      style={({ pressed }) => [
+        styles.button,
+        styles.dangerButton,
+        compact && styles.compactButton,
+        pressed && !disabled && styles.pressed,
+        disabled && styles.disabledButton,
+      ]}
+      onPress={onPress}
+      disabled={disabled}
+      android_ripple={{ color: 'rgba(153,27,27,0.08)' }}
+    >
+      <Text style={styles.dangerText} numberOfLines={1} adjustsFontSizeToFit>{label}</Text>
     </Pressable>
   );
 }
@@ -808,6 +1182,7 @@ const styles = StyleSheet.create({
   safe: {
     flex: 1,
     backgroundColor: '#f5f7fb',
+    paddingTop: Platform.OS === 'android' ? NativeStatusBar.currentHeight ?? 0 : 0,
   },
   shell: {
     flex: 1,
@@ -822,6 +1197,11 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    gap: 12,
+  },
+  headerText: {
+    flex: 1,
+    minWidth: 0,
   },
   title: {
     fontSize: 32,
@@ -852,9 +1232,10 @@ const styles = StyleSheet.create({
     lineHeight: 20,
   },
   center: {
-    flex: 1,
+    flexGrow: 1,
     justifyContent: 'center',
     gap: 14,
+    paddingBottom: 28,
   },
   flex: {
     flex: 1,
@@ -880,10 +1261,18 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#111827',
   },
-  textArea: {
-    minHeight: 150,
-    textAlignVertical: 'top',
+  backupSummary: {
+    backgroundColor: '#ffffff',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 8,
+    padding: 14,
+    gap: 8,
+  },
+  monoPreview: {
+    color: '#374151',
     fontFamily: 'monospace',
+    lineHeight: 20,
   },
   toolbar: {
     flexDirection: 'row',
@@ -906,6 +1295,13 @@ const styles = StyleSheet.create({
   },
   primaryButton: {
     backgroundColor: '#14532d',
+  },
+  disabledButton: {
+    opacity: 0.55,
+  },
+  pressed: {
+    opacity: 0.78,
+    transform: [{ scale: 0.99 }],
   },
   secondaryButton: {
     backgroundColor: '#ffffff',
@@ -949,6 +1345,9 @@ const styles = StyleSheet.create({
     gap: 8,
     paddingBottom: 28,
   },
+  rowWrap: {
+    gap: 8,
+  },
   row: {
     minHeight: 74,
     backgroundColor: '#ffffff',
@@ -961,8 +1360,18 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     gap: 12,
   },
+  rowWorking: {
+    opacity: 0.7,
+  },
+  rowActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 8,
+    paddingRight: 2,
+  },
   rowMain: {
     flex: 1,
+    minWidth: 0,
   },
   rowTitle: {
     color: '#111827',
@@ -976,6 +1385,7 @@ const styles = StyleSheet.create({
   meta: {
     color: '#5b6472',
     fontSize: 13,
+    flexShrink: 0,
   },
   empty: {
     padding: 24,
@@ -1002,6 +1412,10 @@ const styles = StyleSheet.create({
     color: '#111827',
     fontSize: 16,
     fontFamily: 'monospace',
+    lineHeight: 22,
+  },
+  entryContent: {
+    paddingBottom: 28,
   },
   form: {
     gap: 12,
@@ -1028,6 +1442,9 @@ const styles = StyleSheet.create({
   },
   segmentActive: {
     backgroundColor: '#dcfce7',
+  },
+  segmentPressed: {
+    opacity: 0.78,
   },
   segmentText: {
     color: '#111827',

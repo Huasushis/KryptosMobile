@@ -1,6 +1,8 @@
 import { utf8String } from './bytes.ts';
 import {
+  decryptKryptosWithOptionsAsync,
   decryptKryptosWithOptions,
+  encryptKryptosWithOptionsAsync,
   encryptKryptosWithOptions,
   base64ToBytes,
   bytesToBase64,
@@ -77,7 +79,11 @@ export function deserializeEntries(text: string): AccountEntry[] {
   if (lines[0] !== 'KRYPTOS:V1') {
     throw new Error('invalid Kryptos header');
   }
-  const count = Number.parseInt(lines[1] ?? '', 10);
+  const countText = lines[1] ?? '';
+  if (!/^(0|[1-9]\d*)$/.test(countText)) {
+    throw new Error('invalid entry count');
+  }
+  const count = Number(countText);
   if (!Number.isInteger(count) || count < 0 || count > 10000) {
     throw new Error('invalid entry count');
   }
@@ -92,7 +98,10 @@ export function deserializeEntries(text: string): AccountEntry[] {
     if (fields.length !== 5) {
       throw new Error('invalid entry field count');
     }
-    const length = Number.parseInt(fields[3], 10);
+    if (!/^(0|[1-9]\d*)$/.test(fields[3])) {
+      throw new Error('invalid password length');
+    }
+    const length = Number(fields[3]);
     const charsetPreset = unescapeField(fields[4]);
     const entry: AccountEntry = {
       webname: unescapeField(fields[0]),
@@ -102,7 +111,7 @@ export function deserializeEntries(text: string): AccountEntry[] {
       charsetPreset: charsetPreset === 'alphanum' ? 'alphanum' : 'full',
     };
     validateEntry(entry);
-    const duplicateKey = `${entry.webname}\u0000${entry.username}`;
+    const duplicateKey = normalizedIdentityKey(entry);
     if (seen.has(duplicateKey)) {
       throw new Error('duplicate entry in imported data');
     }
@@ -135,6 +144,25 @@ export function exportEntriesBase64(
   return bytesToBase64(encrypted);
 }
 
+export async function exportEntriesBase64Async(
+  entries: readonly AccountEntry[],
+  key = '',
+  nonce?: Uint8Array,
+  options: KryptosCipherOptions = {},
+): Promise<string> {
+  const text = serializeEntries(entries);
+  let encrypted: Uint8Array;
+  if (key.length > 0) {
+    if (!nonce || nonce.length !== 16) {
+      throw new Error('nonce must be 16 bytes when export key is provided');
+    }
+    encrypted = await encryptKryptosWithOptionsAsync(text, key, nonce, options);
+  } else {
+    encrypted = new TextEncoder().encode(text);
+  }
+  return bytesToBase64(encrypted);
+}
+
 export function importEntriesBase64(
   base64: string,
   key = '',
@@ -148,17 +176,34 @@ export function importEntriesBase64(
   return deserializeEntries(utf8String(plaintext));
 }
 
+export async function importEntriesBase64Async(
+  base64: string,
+  key = '',
+  options: KryptosCipherOptions = {},
+): Promise<AccountEntry[]> {
+  const raw = base64ToBytes(base64);
+  if (raw.length === 0) {
+    throw new Error('invalid base64 data');
+  }
+  const plaintext = key.length > 0 ? await decryptKryptosWithOptionsAsync(raw, key, options) : raw;
+  return deserializeEntries(utf8String(plaintext));
+}
+
 export function mergeEntries(current: readonly AccountEntry[], incoming: readonly AccountEntry[]): AccountEntry[] {
   const out = [...current];
-  const seen = new Set(out.map((entry) => `${entry.webname}\u0000${entry.username}`));
+  const seen = new Set(out.map(normalizedIdentityKey));
   for (const entry of incoming) {
-    const key = `${entry.webname}\u0000${entry.username}`;
+    const key = normalizedIdentityKey(entry);
     if (!seen.has(key)) {
       out.push(entry);
       seen.add(key);
     }
   }
   return out;
+}
+
+export function normalizedIdentityKey(entry: Pick<AccountEntry, 'webname' | 'username'>): string {
+  return `${entry.webname.trim().toLowerCase()}\u0000${entry.username.trim().toLowerCase()}`;
 }
 
 export function validateEntry(entry: AccountEntry): void {
