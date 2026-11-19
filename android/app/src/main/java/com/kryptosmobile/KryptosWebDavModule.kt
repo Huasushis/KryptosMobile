@@ -33,7 +33,7 @@ class KryptosWebDavModule(context: ReactApplicationContext) : ReactContextBaseJa
         (if (headers.hasKey("Content-Type")) headers.getString("Content-Type")!! else "text/plain; charset=utf-8").toMediaType())
       val call = client.newCall(builder.method(method, payload).build())
       calls[id] = call
-      call.enqueue(object : Callback {
+      call.enqueue(object : okhttp3.Callback {
         override fun onFailure(call: Call, error: IOException) {
           calls.remove(id)
           promise.reject("WEBDAV_NETWORK", "WebDAV request failed or was cancelled.")
