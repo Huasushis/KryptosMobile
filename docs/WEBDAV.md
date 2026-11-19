@@ -12,7 +12,19 @@
 - 上方 **Backup password**：独立的备份加密密码；所有设备使用相同密码。
 
 点击 **Sync with WebDAV**，通过现有系统身份验证后同步。连接设置随本地
-保险库加密保存，锁定时清空界面中的凭据；备份密码不保存，每次同步重新输入。
+保险库加密保存，锁定时清空界面中的凭据。
+
+上方备份密码框下面提供 **Remember backup encryption password** 开关，勾选后点击
+**Save backup password preference**，即可单独保存，不要求先填写 WebDAV 地址。
+下次进入 Backup 页面自动填入。取消勾选后再次保存会删除已记住的备份密码。
+它只保存在本机加密保险库内，不上传到 WebDAV。同步时也会保存此选项。
+
+WebDAV 登录密码有独立的 **Remember WebDAV login password** 开关，点击
+**Save WebDAV settings** 保存地址、目录、用户名及密码选项。
+**Clear saved connection and passwords** 会清除连接设置和两类已记住的密码，
+保留账号条目。此操作也需要系统身份验证。
+
+WebDAV 目前为手动同步，点击 **Sync with WebDAV** 才会联网；记住密码不会开启后台同步。
 WebDAV 密码和备份密码可以不同。建议使用 HTTPS；HTTP 会明文传输 WebDAV
 认证凭据。Android 支持自建 HTTP 服务，HTTPS 证书始终校验，不跟随重定向。
 

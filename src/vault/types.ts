@@ -17,6 +17,8 @@ export interface VaultState {
   entries: VaultEntry[];
   settings: VaultSettings;
   webdav?: WebDavConfig;
+  // Present only when the user opts to remember it in the encrypted local vault.
+  backupPassword?: string;
 }
 
 export interface VaultSettings {

@@ -39,7 +39,7 @@ import {
   unlockVault,
 } from './src/vault/store.ts';
 import { emptyVault, type VaultEntry, type VaultSettings, type VaultState } from './src/vault/types.ts';
-import { syncAccountsToVaultEntries, vaultEntryToAccountEntry } from './src/vault/model.ts';
+import { syncAccountsToVaultEntries, vaultEntryToAccountEntry, withBackupPasswordPreference, withoutSyncSettings, savedWebDavConnection } from './src/vault/model.ts';
 import { davPaths, syncWebDav, type WebDavConfig, type SyncChoice, type SyncConflict } from './src/sync/webdav.ts';
 import { reviewSyncConflicts, type SyncReview } from './src/sync/review.ts';
 import { webDavTransport } from './src/platform/webdav.ts';
@@ -77,6 +77,8 @@ export default function App() {
   const [generatedPassword, setGeneratedPassword] = useState<string | null>(null);
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [backupPassword, setBackupPassword] = useState('');
+  const [rememberBackupPassword, setRememberBackupPassword] = useState(false);
+  const [rememberDavPassword, setRememberDavPassword] = useState(true);
   const [backupText, setBackupText] = useState('');
   const [davConfig, setDavConfig] = useState<WebDavConfig>({ url: '', directory: 'Kryptos', username: '', password: '' });
   const [syncReview, setSyncReview] = useState<SyncReview | null>(null);
@@ -267,6 +269,8 @@ export default function App() {
   function lockAll(nextMessage = 'Vault locked.', autoUnlock = false): void {
     syncController.current?.abort();
     setSyncReview(null);
+    setRememberBackupPassword(false);
+    setRememberDavPassword(true);
     setDavConfig({ url: '', directory: 'Kryptos', username: '', password: '' });
     operationGeneration.current += 1;
     autoUnlockAttempted.current = !autoUnlock;
@@ -442,7 +446,10 @@ export default function App() {
       if (!backupPassword) throw new Error('Enter the same backup password on all devices.');
       if (!await authenticateVault() || !isCurrentOperation(token)) return;
       // Persist the connection inside the encrypted local vault, never in the remote export.
-      const configured = { ...vault, webdav: { ...davConfig } };
+      const configured = {
+        ...withBackupPasswordPreference(vault, backupPassword, rememberBackupPassword),
+        webdav: savedDavConfig(),
+      };
       await saveVault(configured);
       if (!isCurrentOperation(token)) return;
       setVault(configured);
@@ -482,8 +489,38 @@ export default function App() {
       setSyncReview(null);
       backupInFlight.current = false;
       setBackupBusy(false);
-      setBackupPassword('');
+      if (!isCurrentOperation(token) || !rememberBackupPassword) setBackupPassword('');
     }
+  }
+
+  function savedDavConfig(): WebDavConfig {
+    return savedWebDavConnection(davConfig, rememberDavPassword);
+  }
+
+  async function saveSyncSettings(action: 'backup' | 'connection' | 'clear'): Promise<void> {
+    if (backupInFlight.current) return;
+    const token = operationGeneration.current;
+    backupInFlight.current = true;
+    setBackupBusy(true);
+    try {
+      const next = action === 'clear' ? withoutSyncSettings(vault) : action === 'backup'
+        ? withBackupPasswordPreference(vault, backupPassword, rememberBackupPassword)
+        : { ...vault, webdav: savedDavConfig() };
+      if (action === 'connection') davPaths(davConfig);
+      if (!await authenticateVault() || !isCurrentOperation(token)) return;
+      await saveVault(next);
+      if (!isCurrentOperation(token)) return;
+      setVault(next);
+      if (action === 'clear') {
+        setDavConfig({ url: '', directory: 'Kryptos', username: '', password: '' });
+        setBackupPassword(''); setRememberBackupPassword(false); setRememberDavPassword(true);
+      }
+      setMessage(action === 'clear' ? 'Saved connection and remembered passwords cleared. Accounts were preserved.'
+        : action === 'backup' ? (rememberBackupPassword ? 'Backup encryption password remembered in the encrypted vault.' : 'Remembered backup encryption password removed.')
+        : 'WebDAV settings saved in the encrypted vault.');
+    } catch (error) {
+      if (isCurrentOperation(token)) setMessage(error instanceof Error ? error.message : 'Unable to save settings.');
+    } finally { backupInFlight.current = false; setBackupBusy(false); }
   }
 
   async function exportBackup(): Promise<void> {
@@ -512,7 +549,7 @@ export default function App() {
         return;
       }
       setBackupText(exported);
-      setBackupPassword('');
+      if (!rememberBackupPassword) setBackupPassword('');
       await copyToClipboard(exported);
       if (!isCurrentOperation(token)) {
         return;
@@ -699,8 +736,11 @@ export default function App() {
             onDelete={deleteEntry}
             onCreate={openCreate}
             onBackup={() => {
-              setDavConfig(vault.webdav ?? { url: '', directory: 'Kryptos', username: '', password: '' });
-              setBackupPassword('');
+              const saved = vault.webdav ?? { url: '', directory: 'Kryptos', username: '', password: '' };
+              setDavConfig(saved);
+              setRememberDavPassword(saved.rememberPassword !== false);
+              setRememberBackupPassword(Boolean(vault.backupPassword));
+              setBackupPassword(vault.backupPassword ?? '');
               setBackupText('');
               setScreen('backup');
             }}
@@ -733,6 +773,13 @@ export default function App() {
           <BackupScreen
             mode={vault.settings.importMode}
             backupPassword={backupPassword}
+            rememberBackupPassword={rememberBackupPassword}
+            onRememberBackupPassword={setRememberBackupPassword}
+            onSaveBackupPassword={() => void saveSyncSettings('backup')}
+            rememberDavPassword={rememberDavPassword}
+            onRememberDavPassword={setRememberDavPassword}
+            onSaveDavSettings={() => void saveSyncSettings('connection')}
+            onClearSyncSettings={() => void saveSyncSettings('clear')}
             backupText={backupText}
             onPasswordChange={updateBackupPassword}
             onExport={exportBackup}
@@ -815,8 +862,8 @@ function UnlockScreen({
         <Text style={styles.panelTitle}>Encrypted vault</Text>
         <Text style={styles.bodyText}>
           {unlocking
-            ? 'Waiting for the system security prompt. Passwords are never stored; the prefix is protected by system authentication.'
-            : 'Unlock local metadata with the system security prompt. Passwords are never stored; the prefix is protected by system authentication.'}
+            ? 'Waiting for the system security prompt. Generated account passwords are never stored; the prefix is protected by system authentication.'
+            : 'Unlock local metadata with the system security prompt. Generated account passwords are never stored; the prefix is protected by system authentication.'}
         </Text>
         <PrimaryButton label={unlocking ? 'Unlocking...' : 'Retry unlock'} onPress={onUnlock} disabled={unlocking} />
         <DangerButton
@@ -1092,9 +1139,16 @@ function backupPreview(text: string): string {
     : `${compact.length} characters: ${head}`;
 }
 
-function BackupScreen({
+export function BackupScreen({
   mode,
   backupPassword,
+  rememberBackupPassword,
+  onRememberBackupPassword,
+  onSaveBackupPassword,
+  rememberDavPassword,
+  onRememberDavPassword,
+  onSaveDavSettings,
+  onClearSyncSettings,
   backupText,
   onPasswordChange,
   onExport,
@@ -1110,6 +1164,13 @@ function BackupScreen({
 }: {
   mode: 'merge' | 'replace';
   backupPassword: string;
+  rememberBackupPassword: boolean;
+  onRememberBackupPassword: (value: boolean) => void;
+  onSaveBackupPassword: () => void;
+  rememberDavPassword: boolean;
+  onRememberDavPassword: (value: boolean) => void;
+  onSaveDavSettings: () => void;
+  onClearSyncSettings: () => void;
   backupText: string;
   onPasswordChange: (value: string) => void;
   onExport: () => void;
@@ -1137,6 +1198,12 @@ function BackupScreen({
         placeholderTextColor="#7b8494"
         style={styles.input}
       />
+      <View style={styles.settingRow}>
+        <Text style={styles.settingLabel}>Remember backup encryption password</Text>
+        <Switch value={rememberBackupPassword} onValueChange={onRememberBackupPassword} disabled={busy} />
+      </View>
+      <Text style={styles.bodyText}>Save this preference below. Remembered passwords stay inside the encrypted local vault and are filled in next time. Switching off and saving removes the remembered password. Sync also saves this preference.</Text>
+      <SecondaryButton label="Save backup password preference" onPress={onSaveBackupPassword} disabled={busy || (rememberBackupPassword && !backupPassword)} />
       <View style={styles.backupSummary}>
         <Text style={styles.label}>Loaded backup</Text>
         <Text style={styles.monoPreview} selectable>{backupPreview(backupText)}</Text>
@@ -1155,6 +1222,13 @@ function BackupScreen({
           <TextInput value={davConfig[key]} editable={!busy} onChangeText={(value) => onDavChange({ ...davConfig, [key]: value })} secureTextEntry={key === 'password'} autoCapitalize="none" autoCorrect={false} style={styles.input} />
         </View>
       ))}
+      <View style={styles.settingRow}>
+        <Text style={styles.settingLabel}>Remember WebDAV login password</Text>
+        <Switch value={rememberDavPassword} onValueChange={onRememberDavPassword} disabled={busy} />
+      </View>
+      <SecondaryButton label="Save WebDAV settings" onPress={onSaveDavSettings} disabled={busy} />
+      <SecondaryButton label="Clear saved connection and passwords" onPress={onClearSyncSettings} disabled={busy} />
+      <Text style={styles.bodyText}>WebDAV sync runs when you tap the button below. It does not run automatically in the background.</Text>
       <PrimaryButton label="Sync with WebDAV" onPress={onSync} disabled={busy} />
       <SecondaryButton label="Back" onPress={onBack} disabled={busy} />
     </ScrollView>

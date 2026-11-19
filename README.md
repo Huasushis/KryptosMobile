@@ -86,7 +86,7 @@ Release signing material is generated locally at `android/app/kryptos-release.ke
 - UI state is updated after vault writes succeed, so failed writes do not pretend to be saved.
 - Export files are encrypted with a separate backup password.
 - Manual WebDAV sync uploads only encrypted KryptosCore-compatible metadata.
-- WebDAV settings are stored inside the encrypted local vault; the sync backup password is never stored.
+- WebDAV settings are stored inside the encrypted local vault. Login and backup encryption passwords can be remembered separately, with explicit save and clear controls on the Backup screen. Sync is manual.
 - No analytics SDK or remote logging is included.
 
 ## Implemented Screens

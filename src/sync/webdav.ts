@@ -7,6 +7,7 @@ export interface WebDavConfig {
   directory: string;
   username: string;
   password: string;
+  rememberPassword?: boolean;
 }
 
 export interface DavResponse {

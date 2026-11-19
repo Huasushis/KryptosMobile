@@ -10,6 +10,7 @@ import {
   type AccountEntry,
 } from '../kryptos/manager.ts';
 import type { KryptosCipherOptions } from '../kryptos/crypto.ts';
+import type { WebDavConfig } from '../sync/webdav.ts';
 import { defaultSettings, emptyVault, type VaultEntry, type VaultSettings, type VaultState } from './types.ts';
 
 export function vaultEntryToAccountEntry(entry: VaultEntry): AccountEntry {
@@ -105,8 +106,28 @@ export function validateVaultState(value: unknown): VaultState {
       url: String(candidate.webdav.url ?? ''),
       directory: String(candidate.webdav.directory ?? 'Kryptos'),
       username: String(candidate.webdav.username ?? ''),
-      password: String(candidate.webdav.password ?? ''),
+      password: candidate.webdav.rememberPassword === false ? '' : String(candidate.webdav.password ?? ''),
+      rememberPassword: candidate.webdav.rememberPassword !== false,
     } } : {}),
+    ...(typeof candidate.backupPassword === 'string' && candidate.backupPassword.length > 0 ? { backupPassword: candidate.backupPassword } : {}),
+  };
+}
+
+export function withBackupPasswordPreference(vault: VaultState, password: string, remember: boolean): VaultState {
+  if (remember && !password) throw new Error('Enter a backup encryption password before remembering it.');
+  const { backupPassword: ignored, ...rest } = vault;
+  return remember ? { ...rest, backupPassword: password } : rest;
+}
+
+export function withoutSyncSettings(vault: VaultState): VaultState {
+  const { webdav: ignoredConnection, backupPassword: ignoredPassword, ...rest } = vault;
+  return rest;
+}
+
+export function savedWebDavConnection(config: WebDavConfig, remember: boolean): WebDavConfig {
+  return {
+    url: config.url, directory: config.directory, username: config.username,
+    password: remember ? config.password : '', rememberPassword: remember,
   };
 }
 

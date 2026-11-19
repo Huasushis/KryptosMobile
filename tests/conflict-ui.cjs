@@ -16,7 +16,7 @@ let openedRelease;
 function screenRequire(name) {
   if (name === 'react' || name === 'react/jsx-runtime') return require(name);
   if (name === 'react-native') return {
-    Text: 'Text', View: 'View', ScrollView: 'ScrollView', Pressable: 'Pressable', Switch: 'Switch',
+    Text: 'Text', TextInput: 'TextInput', View: 'View', ScrollView: 'ScrollView', Pressable: 'Pressable', Switch: 'Switch',
     Linking: { openURL: async (url) => { openedRelease = url; } },
     StyleSheet: { create: (styles) => styles }, Platform: { OS: 'test' },
   };
@@ -92,3 +92,31 @@ click('Open releases (manual download)');
 assert.equal(openedRelease, 'https://github.com/Huasushis/KryptosMobile/releases/latest');
 act(() => renderer.unmount());
 console.log('ok - Update settings separate checking from installation and prevent duplicate actions while busy');
+
+const { BackupScreen } = exportsForTest;
+let savedPassword = 0, savedConnection = 0, clearedSettings = 0, synced = 0, rememberBackup = false;
+const backupProps = {
+  mode: 'merge', backupPassword: '', rememberBackupPassword: false, onRememberBackupPassword: (value) => { rememberBackup = value; },
+  onSaveBackupPassword: () => { savedPassword++; }, rememberDavPassword: true, onRememberDavPassword: () => {},
+  onSaveDavSettings: () => { savedConnection++; }, onClearSyncSettings: () => { clearedSettings++; }, backupText: '',
+  onPasswordChange: () => {}, onExport: () => {}, onImport: () => {}, onPaste: () => {}, onCopyBackup: () => {}, onClearBackup: () => {},
+  busy: false, davConfig: { url: '', directory: 'Kryptos', username: '', password: '' }, onDavChange: () => {}, onSync: () => { synced++; }, onBack: () => {},
+};
+act(() => { renderer = create(React.createElement(BackupScreen, backupProps)); });
+assert.equal(synced, 0); // Opening Backup or saving preferences must not trigger sync.
+act(() => renderer.root.findAllByType('Switch')[0].props.onValueChange(true));
+assert.equal(rememberBackup, true);
+act(() => renderer.update(React.createElement(BackupScreen, { ...backupProps, rememberBackupPassword: true })));
+assert.equal(button('Save backup password preference').props.disabled, true);
+act(() => renderer.update(React.createElement(BackupScreen, { ...backupProps, backupPassword: 'secret', rememberBackupPassword: true })));
+assert.equal(renderer.root.findAllByType('TextInput')[0].props.secureTextEntry, true);
+click('Save backup password preference'); assert.equal(savedPassword, 1);
+click('Save WebDAV settings'); assert.equal(savedConnection, 1);
+click('Clear saved connection and passwords'); assert.equal(clearedSettings, 1);
+assert.equal(synced, 0);
+click('Sync with WebDAV'); assert.equal(synced, 1);
+act(() => renderer.update(React.createElement(BackupScreen, { ...backupProps, busy: true })));
+assert.equal(button('Save backup password preference').props.disabled, true);
+assert.equal(button('Clear saved connection and passwords').props.disabled, true);
+act(() => renderer.unmount());
+console.log('ok - Backup remembers passwords explicitly, supports separate settings/clear, and syncs only on request');
