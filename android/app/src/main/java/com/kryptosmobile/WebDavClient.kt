@@ -1,4 +1,4 @@
-package com.kryptosmobile
+package com.huasushis.kryptosmobile
 
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
