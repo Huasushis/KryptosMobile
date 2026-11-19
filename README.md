@@ -43,6 +43,12 @@ node --experimental-strip-types tests/run.ts
 
 ## Android APK
 
+Settings includes manual update checks and installation, optional checks after
+unlock, and a manual Release download link. Android verifies the package, hash,
+version and existing signing key before opening the system installer. Stable
+upgradeable releases require persistent signing secrets and a `vMAJOR.MINOR.PATCH`
+tag; temporary preview APKs cannot upgrade each other. See [updates](docs/UPDATES.md).
+
 GitHub Actions now builds standalone APKs automatically on push, or manually from
 **Actions → Android APK**. Download the APK from the run's Artifacts. Builds need
 no signing secrets for previews; configure the four Android signing secrets for

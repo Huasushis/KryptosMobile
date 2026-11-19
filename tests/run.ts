@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import './webdav.ts';
+import './update.ts';
 import { webcrypto } from 'node:crypto';
 
 import {

@@ -10,6 +10,8 @@ names = ('ANDROID_KEYSTORE_BASE64', 'ANDROID_KEYSTORE_PASSWORD', 'ANDROID_KEY_AL
 values = [os.environ.get(name, '') for name in names]
 if any(values) and not all(values):
     raise SystemExit('Configure all four Android signing secrets, or leave all four unset for preview builds.')
+if os.environ.get('GITHUB_REF', '').startswith('refs/tags/') and not all(values):
+    raise SystemExit('Stable releases require the four persistent Android signing secrets. Temporary preview keys cannot support upgrades.')
 
 if all(values):
     encoded, store_password, alias, key_password = values

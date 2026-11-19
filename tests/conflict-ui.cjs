@@ -12,12 +12,15 @@ const compiled = ts.transpileModule(source, { compilerOptions: {
   jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022,
 } }).outputText;
 const exportsForTest = {};
+let openedRelease;
 function screenRequire(name) {
   if (name === 'react' || name === 'react/jsx-runtime') return require(name);
   if (name === 'react-native') return {
-    Text: 'Text', View: 'View', ScrollView: 'ScrollView', Pressable: 'Pressable',
+    Text: 'Text', View: 'View', ScrollView: 'ScrollView', Pressable: 'Pressable', Switch: 'Switch',
+    Linking: { openURL: async (url) => { openedRelease = url; } },
     StyleSheet: { create: (styles) => styles }, Platform: { OS: 'test' },
   };
+  if (name === './src/update/release.ts') return { RELEASE_PAGE: 'https://github.com/Huasushis/KryptosMobile/releases/latest' };
   return {}; // Other App imports are unused by SyncConflictScreen.
 }
 new Function('require', 'exports', compiled)(screenRequire, exportsForTest);
@@ -67,3 +70,25 @@ assert.equal(cancels, 1);
 assert.equal(applied, undefined);
 act(() => renderer.unmount());
 console.log('ok - Conflict screen requires every choice, preserves navigation, submits mixed choices and supports cancellation');
+
+const { UpdateSettings } = exportsForTest;
+let checked = 0, installed = 0, auto = false;
+const updateProps = {
+  version: '1.1.0', supported: true, autoCheck: false, onAutoCheck: (value) => { auto = value; },
+  available: null, busy: false, message: '', onCheck: () => { checked++; }, onInstall: () => { installed++; },
+};
+act(() => { renderer = create(React.createElement(UpdateSettings, updateProps)); });
+assert.equal(installed, 0); // Opening the settings must never install anything.
+click('Check for updates'); assert.equal(checked, 1);
+act(() => renderer.root.findByType('Switch').props.onValueChange(true)); assert.equal(auto, true);
+const available = { version: '1.2.0', versionCode: 1002000, sha256: 'a'.repeat(64), url: 'unused' };
+act(() => renderer.update(React.createElement(UpdateSettings, { ...updateProps, available })));
+assert.equal(installed, 0); // Finding a release still requires an explicit install action.
+click('Download and install 1.2.0'); assert.equal(installed, 1);
+act(() => renderer.update(React.createElement(UpdateSettings, { ...updateProps, available, busy: true })));
+assert.equal(button('Working...').props.disabled, true);
+assert.equal(button('Download and install 1.2.0').props.disabled, true);
+click('Open releases (manual download)');
+assert.equal(openedRelease, 'https://github.com/Huasushis/KryptosMobile/releases/latest');
+act(() => renderer.unmount());
+console.log('ok - Update settings separate checking from installation and prevent duplicate actions while busy');

@@ -95,6 +95,7 @@ export function validateVaultState(value: unknown): VaultState {
     preventScreenshots: Boolean(rawSettings.preventScreenshots),
     importMode: rawSettings.importMode === 'replace' ? 'replace' : 'merge',
     hasStoredPrefix: Boolean(rawSettings.hasStoredPrefix),
+    autoCheckUpdates: rawSettings.autoCheckUpdates === true,
   };
   return {
     version: 1,

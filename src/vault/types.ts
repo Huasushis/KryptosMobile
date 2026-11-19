@@ -25,6 +25,7 @@ export interface VaultSettings {
   preventScreenshots: boolean;
   importMode: 'merge' | 'replace';
   hasStoredPrefix: boolean;
+  autoCheckUpdates: boolean;
 }
 
 export const defaultSettings: VaultSettings = {
@@ -33,6 +34,7 @@ export const defaultSettings: VaultSettings = {
   preventScreenshots: true,
   importMode: 'merge',
   hasStoredPrefix: false,
+  autoCheckUpdates: false,
 };
 
 export function emptyVault(): VaultState {

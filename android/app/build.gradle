@@ -99,7 +99,7 @@ android {
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode = (project.findProperty('kryptosVersionCode') ?: '1').toString().toInteger()
-        versionName "1.0"
+        versionName = (project.findProperty('kryptosVersionName') ?: '1.1.0').toString()
 
         buildConfigField "String", "REACT_NATIVE_RELEASE_LEVEL", "\"${findProperty('reactNativeReleaseLevel') ?: 'stable'}\""
     }

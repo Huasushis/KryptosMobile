@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AppState,
   KeyboardAvoidingView,
+  Linking,
   PanResponder,
   Platform,
   Pressable,
@@ -42,6 +43,8 @@ import { syncAccountsToVaultEntries, vaultEntryToAccountEntry } from './src/vaul
 import { davPaths, syncWebDav, type WebDavConfig, type SyncChoice, type SyncConflict } from './src/sync/webdav.ts';
 import { reviewSyncConflicts, type SyncReview } from './src/sync/review.ts';
 import { webDavTransport } from './src/platform/webdav.ts';
+import { canInstallUpdates, checkForAppUpdate, installedVersion, installAppUpdate } from './src/platform/update.ts';
+import { RELEASE_PAGE, type AppUpdate } from './src/update/release.ts';
 
 type Screen = 'unlock' | 'prefix' | 'home' | 'entry' | 'edit' | 'settings' | 'backup';
 
@@ -83,6 +86,11 @@ export default function App() {
   const [unlocking, setUnlocking] = useState(false);
   const [backupBusy, setBackupBusy] = useState(false);
   const [workingEntryId, setWorkingEntryId] = useState<string | null>(null);
+  const [appUpdate, setAppUpdate] = useState<AppUpdate | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateMessage, setUpdateMessage] = useState('');
+  const updateInFlight = useRef(false);
+  const autoUpdateChecked = useRef(false);
   const [swipedId, setSwipedId] = useState<string | null>(null);
   const backgroundAt = useRef<number | null>(null);
   const screenRef = useRef<Screen>('unlock');
@@ -113,6 +121,32 @@ export default function App() {
   useEffect(() => {
     screenRef.current = screen;
   }, [screen]);
+
+  useEffect(() => {
+    if (screen === 'unlock' || !vault.settings.autoCheckUpdates || !canInstallUpdates || autoUpdateChecked.current) return;
+    autoUpdateChecked.current = true;
+    void checkUpdates();
+  }, [screen, vault.settings.autoCheckUpdates]);
+
+  async function checkUpdates(): Promise<void> {
+    if (updateInFlight.current) return;
+    updateInFlight.current = true; setUpdateBusy(true); setUpdateMessage('Checking stable releases...');
+    try {
+      const next = await checkForAppUpdate();
+      setAppUpdate(next);
+      setUpdateMessage(next ? `Version ${next.version} is available. Install it from Settings.` : 'Already up to date.');
+    } catch (error) { setUpdateMessage(error instanceof Error ? error.message : 'Unable to check updates.'); }
+    finally { updateInFlight.current = false; setUpdateBusy(false); }
+  }
+  async function installUpdate(): Promise<void> {
+    if (!appUpdate || updateInFlight.current) return;
+    updateInFlight.current = true; setUpdateBusy(true); setUpdateMessage('Downloading and verifying update...');
+    try {
+      const result = await installAppUpdate(appUpdate);
+      setUpdateMessage(result === 'permission' ? 'Allow installs from Kryptos in system settings, then tap Download and install again.' : 'Confirm the update in the Android installer. Your vault stays on this device.');
+    } catch (error) { setUpdateMessage(error instanceof Error ? error.message : 'Unable to install update.'); }
+    finally { updateInFlight.current = false; setUpdateBusy(false); }
+  }
 
   useEffect(() => {
     if (screen !== 'unlock' || autoUnlockAttempted.current) {
@@ -630,6 +664,7 @@ export default function App() {
         <Header screen={screen} onLock={() => lockAll()} />
         {notice ? <Text style={styles.notice}>{notice}</Text> : null}
         {message ? <Text style={styles.message}>{message}</Text> : null}
+        {screen !== 'unlock' && appUpdate ? <Text style={styles.notice}>Update {appUpdate.version} available · open Settings to install.</Text> : null}
 
         {screen === 'unlock' ? (
           <UnlockScreen
@@ -718,6 +753,7 @@ export default function App() {
           />
         ) : (
           <SettingsScreen
+            update={{ available: appUpdate, busy: updateBusy, message: updateMessage, onCheck: () => void checkUpdates(), onInstall: () => void installUpdate() }}
             settings={vault.settings}
             onChange={updateSettings}
             onPrefix={() => {
@@ -1173,6 +1209,7 @@ export function SyncConflictScreen({ conflicts, onResolve, onCancel }: {
 }
 
 function SettingsScreen({
+  update,
   settings,
   onChange,
   onPrefix,
@@ -1180,6 +1217,7 @@ function SettingsScreen({
   clearConfirm,
   onBack,
 }: {
+  update: { available: AppUpdate | null; busy: boolean; message: string; onCheck: () => void; onInstall: () => void };
   settings: VaultSettings;
   onChange: (settings: Partial<VaultSettings>) => void;
   onPrefix: () => void;
@@ -1190,6 +1228,8 @@ function SettingsScreen({
   return (
     <ScrollView style={styles.flex} contentContainerStyle={styles.form}>
       <Text style={styles.panelTitle}>Settings</Text>
+      <UpdateSettings version={installedVersion} supported={canInstallUpdates} autoCheck={settings.autoCheckUpdates}
+        onAutoCheck={(autoCheckUpdates) => onChange({ autoCheckUpdates })} {...update} />
       <View style={styles.settingRow}>
         <Text style={styles.settingLabel}>Block screenshots</Text>
         <Switch
@@ -1216,6 +1256,26 @@ function SettingsScreen({
       <SecondaryButton label="Back" onPress={onBack} />
     </ScrollView>
   );
+}
+
+export function UpdateSettings({ version, supported, autoCheck, onAutoCheck, available, busy, message, onCheck, onInstall }: {
+  version: string; supported: boolean; autoCheck: boolean; onAutoCheck: (enabled: boolean) => void;
+  available: AppUpdate | null; busy: boolean; message: string; onCheck: () => void; onInstall: () => void;
+}) {
+  return <View>
+    <Text style={styles.label}>App updates · installed {version}</Text>
+    <Text style={styles.bodyText}>Checks use GitHub Releases. Installation requires your confirmation and the same signing key. Your vault is preserved during an upgrade.</Text>
+    {supported ? <>
+      <View style={styles.settingRow}>
+        <Text style={styles.settingLabel}>Check for updates after unlock</Text>
+        <Switch value={autoCheck} onValueChange={onAutoCheck} />
+      </View>
+      <SecondaryButton label={busy ? 'Working...' : 'Check for updates'} onPress={onCheck} disabled={busy} />
+      {available ? <PrimaryButton label={`Download and install ${available.version}`} onPress={onInstall} disabled={busy} /> : null}
+    </> : null}
+    {message ? <Text style={styles.bodyText}>{message}</Text> : null}
+    <SecondaryButton label="Open releases (manual download)" onPress={() => { void Linking.openURL(RELEASE_PAGE).catch(() => undefined); }} />
+  </View>;
 }
 
 function Field({
