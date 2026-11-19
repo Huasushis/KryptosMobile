@@ -38,8 +38,9 @@ import {
   unlockVault,
 } from './src/vault/store.ts';
 import { emptyVault, type VaultEntry, type VaultSettings, type VaultState } from './src/vault/types.ts';
-import { accountEntryToVaultEntry, identityKey, vaultEntryToAccountEntry } from './src/vault/model.ts';
-import { davPaths, syncWebDav, type WebDavConfig } from './src/sync/webdav.ts';
+import { syncAccountsToVaultEntries, vaultEntryToAccountEntry } from './src/vault/model.ts';
+import { davPaths, syncWebDav, type WebDavConfig, type SyncChoice, type SyncConflict } from './src/sync/webdav.ts';
+import { reviewSyncConflicts, type SyncReview } from './src/sync/review.ts';
 import { webDavTransport } from './src/platform/webdav.ts';
 
 type Screen = 'unlock' | 'prefix' | 'home' | 'entry' | 'edit' | 'settings' | 'backup';
@@ -75,6 +76,7 @@ export default function App() {
   const [backupPassword, setBackupPassword] = useState('');
   const [backupText, setBackupText] = useState('');
   const [davConfig, setDavConfig] = useState<WebDavConfig>({ url: '', directory: 'Kryptos', username: '', password: '' });
+  const [syncReview, setSyncReview] = useState<SyncReview | null>(null);
   const [message, setMessage] = useState('');
   const [clearConfirm, setClearConfirm] = useState(false);
   const [recoveryClearConfirm, setRecoveryClearConfirm] = useState(false);
@@ -230,6 +232,7 @@ export default function App() {
 
   function lockAll(nextMessage = 'Vault locked.', autoUnlock = false): void {
     syncController.current?.abort();
+    setSyncReview(null);
     setDavConfig({ url: '', directory: 'Kryptos', username: '', password: '' });
     operationGeneration.current += 1;
     autoUnlockAttempted.current = !autoUnlock;
@@ -399,7 +402,7 @@ export default function App() {
     syncController.current = controller;
     backupInFlight.current = true;
     setBackupBusy(true);
-    const timeout = setTimeout(() => controller.abort(), 120_000);
+    let timeout = setTimeout(() => controller.abort(), 120_000);
     try {
       davPaths(davConfig);
       if (!backupPassword) throw new Error('Enter the same backup password on all devices.');
@@ -414,10 +417,24 @@ export default function App() {
       const accounts = await syncWebDav({
         config: davConfig, entries: vault.entries.map(vaultEntryToAccountEntry), backupPassword,
         nonce: () => randomBytes(16), transport: webDavTransport, signal: controller.signal,
+        resolveConflicts: async (conflicts) => {
+          if (!isCurrentOperation(token)) throw new Error('WebDAV sync cancelled.');
+          // Give the user time to inspect each account. Lock/cancel still aborts.
+          clearTimeout(timeout);
+          setMessage('Choose which version to keep for each account.');
+          try {
+            return await reviewSyncConflicts(controller.signal, (complete) => {
+              setSyncReview({ conflicts, complete });
+              return () => setSyncReview(null);
+            });
+          } finally {
+            timeout = setTimeout(() => controller.abort(), 120_000);
+            if (isCurrentOperation(token)) setMessage('Applying choices and syncing encrypted metadata...');
+          }
+        },
       });
       if (!isCurrentOperation(token) || controller.signal.aborted) return;
-      const existing = new Map(vault.entries.map((entry) => [identityKey(entry), entry]));
-      const entries = accounts.map((entry) => existing.get(identityKey(entry)) ?? accountEntryToVaultEntry(entry));
+      const entries = syncAccountsToVaultEntries(accounts, vault.entries);
       const next = { ...configured, entries };
       await saveVault(next);
       if (!isCurrentOperation(token)) return;
@@ -428,6 +445,7 @@ export default function App() {
     } finally {
       clearTimeout(timeout);
       syncController.current = null;
+      setSyncReview(null);
       backupInFlight.current = false;
       setBackupBusy(false);
       setBackupPassword('');
@@ -673,6 +691,9 @@ export default function App() {
             onSubmit={submitEntry}
             onCancel={() => setScreen(selectedEntry ? 'entry' : 'home')}
           />
+        ) : screen === 'backup' && syncReview ? (
+          <SyncConflictScreen conflicts={syncReview.conflicts} onResolve={syncReview.complete}
+            onCancel={() => syncController.current?.abort()} />
         ) : screen === 'backup' ? (
           <BackupScreen
             mode={vault.settings.importMode}
@@ -1091,7 +1112,7 @@ function BackupScreen({
       <SecondaryButton label="Import loaded backup" onPress={onImport} disabled={busy || !hasBackupText} />
       <SecondaryButton label="Clear loaded backup" onPress={onClearBackup} disabled={busy || !hasBackupText} />
       <Text style={styles.panelTitle}>WebDAV sync</Text>
-      <Text style={styles.bodyText}>Use the same directory and backup password on every device. Missing directories are created automatically. Sync merges additions; deletions are not propagated. Conflicting password data stops sync. Connection settings are saved encrypted on this device when syncing.</Text>
+      <Text style={styles.bodyText}>Use the same directory and backup password on every device. Missing directories are created automatically. Sync merges additions; deletions are not propagated. If versions differ, choose local or cloud for each account before syncing. Connection settings are saved encrypted on this device when syncing.</Text>
       {(['url', 'directory', 'username', 'password'] as const).map((key) => (
         <View key={key}>
           <Text style={styles.label}>{({ url: 'WebDAV root URL', directory: 'Sync directory (relative to root URL)', username: 'WebDAV username', password: 'WebDAV password / app token' })[key]}</Text>
@@ -1100,6 +1121,53 @@ function BackupScreen({
       ))}
       <PrimaryButton label="Sync with WebDAV" onPress={onSync} disabled={busy} />
       <SecondaryButton label="Back" onPress={onBack} disabled={busy} />
+    </ScrollView>
+  );
+}
+
+export function SyncConflictScreen({ conflicts, onResolve, onCancel }: {
+  conflicts: readonly SyncConflict[];
+  onResolve: (choices: readonly SyncChoice[]) => void;
+  onCancel: () => void;
+}) {
+  const [index, setIndex] = useState(0);
+  const [choices, setChoices] = useState<(SyncChoice | undefined)[]>(() => conflicts.map(() => undefined));
+  const [submitting, setSubmitting] = useState(false);
+  const conflict = conflicts[index];
+  const choice = choices[index];
+  function choose(value: SyncChoice): void {
+    setChoices((previous) => previous.map((current, position) => position === index ? value : current));
+  }
+  return (
+    <ScrollView style={styles.flex} contentContainerStyle={styles.form}>
+      <Text style={styles.panelTitle}>Resolve sync conflicts</Text>
+      <Text style={styles.label}>Account {index + 1} of {conflicts.length}</Text>
+      <Text style={styles.bodyText}>Choose the version that generates the password you currently use. Your choice updates both this device and the cloud after you confirm all accounts. Other accounts are merged automatically.</Text>
+      {(['local', 'remote'] as const).map((side) => (
+        <View key={side} style={styles.backupSummary}>
+          <Text style={styles.label}>{side === 'local' ? 'Local version (this device)' : 'Cloud version'}</Text>
+          <Text style={styles.bodyText}>Site: {conflict[side].webname}</Text>
+          <Text style={styles.bodyText}>Username: {conflict[side].username}</Text>
+          <Text style={styles.bodyText}>Password length: {conflict[side].length}</Text>
+          <Text style={styles.bodyText}>Character set: {conflict[side].charsetPreset}</Text>
+        </View>
+      ))}
+      {conflict.local.uuid !== conflict.remote.uuid ? (
+        <Text style={styles.notice}>The account seeds differ. Even with the same length and character set, these versions generate different passwords.</Text>
+      ) : null}
+      <SecondaryButton label={choice === 'local' ? 'Selected: keep local' : 'Keep local'} onPress={() => choose('local')} disabled={submitting} />
+      <SecondaryButton label={choice === 'remote' ? 'Selected: use cloud' : 'Use cloud'} onPress={() => choose('remote')} disabled={submitting} />
+      {index > 0 ? <SecondaryButton label="Previous account" onPress={() => setIndex(index - 1)} disabled={submitting} /> : null}
+      {index < conflicts.length - 1 ? (
+        <PrimaryButton label="Next account" onPress={() => setIndex(index + 1)} disabled={!choice || submitting} />
+      ) : (
+        <PrimaryButton label="Apply choices and sync" disabled={choices.some((value) => !value) || submitting} onPress={() => {
+          if (choices.some((value) => !value) || submitting) return;
+          setSubmitting(true);
+          onResolve(choices as SyncChoice[]);
+        }} />
+      )}
+      <SecondaryButton label="Cancel sync" onPress={onCancel} disabled={submitting} />
     </ScrollView>
   );
 }

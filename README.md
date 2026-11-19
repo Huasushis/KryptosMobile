@@ -90,7 +90,7 @@ Release signing material is generated locally at `android/app/kryptos-release.ke
 - Home: searchable metadata list with add, backup, settings, prefix, and lock actions.
 - Entry detail: generate/show/copy password without listing stored passwords.
 - Edit: site, username, length, and `full`/`alphanum` charset controls with duplicate blocking.
-- Backup: KryptosCore-compatible encrypted Base64 import/export with merge/replace policy, plus WebDAV sync with automatic directory creation and conditional uploads.
+- Backup: KryptosCore-compatible encrypted Base64 import/export with merge/replace policy, plus WebDAV sync with automatic directory creation, per-account local/cloud conflict choices, and conditional uploads.
 - Settings: auto-lock, background-lock, screenshot blocking, import mode, and two-step vault clear.
 
 ## Current Verification

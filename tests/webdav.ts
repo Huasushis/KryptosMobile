@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { davPaths, mergeForSync, syncWebDav, type DavTransport, type WebDavConfig } from '../src/sync/webdav.ts';
+import { davPaths, mergeForSync, planSyncMerge, resolveSyncMerge, syncWebDav, type DavTransport, type WebDavConfig } from '../src/sync/webdav.ts';
+import { reviewSyncConflicts } from '../src/sync/review.ts';
+import { accountEntryToVaultEntry, syncAccountsToVaultEntries } from '../src/vault/model.ts';
 import { exportEntriesBase64Async, importEntriesBase64Async, type AccountEntry } from '../src/kryptos/manager.ts';
 
 const cipherOptions = { kdfIterations: 32, yieldEveryIterations: 4 };
@@ -13,6 +15,37 @@ for (const url of ['file:///bad', 'https://user:pass@dav.example/', 'https://dav
 assert.throws(() => mergeForSync([local], [{ ...local, uuid: 'different' }]), /conflict/);
 assert.throws(() => mergeForSync([local], [{ ...local, webname: 'LOCAL.EXAMPLE' }]), /conflict/);
 assert.equal(mergeForSync([local], [local, remote]).length, 2);
+assert.throws(() => planSyncMerge([local, local], []), /Duplicate/);
+const plan = planSyncMerge([local], [{ ...local, uuid: 'cloud-uuid', length: 20 }]);
+assert.throws(() => resolveSyncMerge(plan, []), /every sync conflict/);
+assert.throws(() => resolveSyncMerge(plan, new Array(1)), /every sync conflict/);
+assert.deepEqual(resolveSyncMerge(plan, ['local']), [local]);
+const selectedCloud = resolveSyncMerge(plan, ['remote'])[0];
+assert.equal(selectedCloud.uuid, 'cloud-uuid');
+assert.equal(selectedCloud.length, 20);
+const oldVault = accountEntryToVaultEntry(local);
+const updatedVault = syncAccountsToVaultEntries([selectedCloud], [oldVault])[0];
+assert.equal(updatedVault.uuid, 'cloud-uuid');
+assert.equal(updatedVault.length, 20);
+assert.equal(updatedVault.id, oldVault.id);
+assert.equal(updatedVault.createdAt, oldVault.createdAt);
+assert.equal(oldVault.uuid, local.uuid);
+assert.equal(syncAccountsToVaultEntries([local], [oldVault])[0], oldVault);
+
+const reviewAbort = new AbortController();
+let dismissed = false;
+let lateComplete: ((choices: readonly ('local' | 'remote')[]) => void) | undefined;
+const cancelledReview = reviewSyncConflicts(reviewAbort.signal, (complete) => {
+  lateComplete = complete;
+  return () => { dismissed = true; };
+});
+reviewAbort.abort();
+await assert.rejects(() => cancelledReview, /cancelled/);
+assert.equal(dismissed, true);
+lateComplete!(['remote']); // A late button event cannot revive the cancelled review.
+assert.deepEqual(await reviewSyncConflicts(new AbortController().signal, (complete) => {
+  complete(['local']); return () => {};
+}), ['local']);
 
 let stored: string | undefined;
 let tag = 0;
@@ -105,7 +138,54 @@ try {
     transport: async (...args) => { const result = await transport(...args); if (args[1] === 'GET') abort.abort(); return result; },
   }), /cancelled/);
   assert.equal(puts, count);
+  // Resolve two conflicts differently while preserving additions from both devices.
+  const otherLocal = { ...remote, length: 24 };
+  const cloudLocal = { ...local, uuid: 'cloud-uuid', length: 20 };
+  const cloudOther = { ...remote, charsetPreset: 'alphanum' as const };
+  const cloudOnly = { ...remote, webname: 'cloud-only.example' };
+  const localOnly = { ...local, webname: 'local-only.example' };
+  stored = await exportEntriesBase64Async([cloudLocal, cloudOther, cloudOnly], 'backup-password', new Uint8Array(16), cipherOptions);
+  const input = [local, otherLocal, localOnly];
+  const inputBefore = JSON.stringify(input);
+  const resolvingOptions = {
+    config: liveConfig, entries: input, backupPassword: 'backup-password', nonce: async () => new Uint8Array(16).fill(8),
+    transport, signal: new AbortController().signal, cipherOptions,
+  };
+  const resolved = await syncWebDav({ ...resolvingOptions, resolveConflicts: async (conflicts) => {
+    assert.equal(conflicts.length, 2);
+    assert.equal(conflicts[0].remote.uuid, 'cloud-uuid');
+    return ['remote', 'local'];
+  } });
+  assert.deepEqual(resolved, [cloudLocal, otherLocal, localOnly, cloudOnly]);
+  assert.deepEqual(await importEntriesBase64Async(stored!, 'backup-password', cipherOptions), resolved);
+  assert.equal(JSON.stringify(input), inputBefore);
+  const resolvedPuts = puts;
+  const resolvedBody = stored;
+  await assert.rejects(() => syncWebDav({ ...resolvingOptions, resolveConflicts: async () => [] }), /every sync conflict/);
+  await assert.rejects(() => syncWebDav({ ...resolvingOptions, resolveConflicts: async () => { throw new Error('Cancelled by user'); } }), /Cancelled/);
+  assert.equal(puts, resolvedPuts);
+  assert.equal(stored, resolvedBody);
+  // Another device changes the remote while the user is reviewing. Never reuse the old choice.
+  const newer = { ...cloudLocal, length: 32 };
+  const newerBody = await exportEntriesBase64Async([newer, otherLocal, cloudOnly], 'backup-password', new Uint8Array(16), cipherOptions);
+  await assert.rejects(() => syncWebDav({ ...resolvingOptions, resolveConflicts: async () => {
+    stored = newerBody; tag++;
+    return ['local'];
+  } }), /Remote data changed/);
+  assert.equal(stored, newerBody);
+  const retried = await syncWebDav({ ...resolvingOptions, resolveConflicts: async (conflicts) => {
+    assert.equal(conflicts[0].remote.length, 32);
+    return ['remote'];
+  } });
+  assert.equal(retried[0].length, 32);
+  const lock = new AbortController();
+  const beforeLockPuts = puts;
+  await assert.rejects(() => syncWebDav({ ...resolvingOptions, signal: lock.signal, resolveConflicts: async () => {
+    lock.abort(); return ['local'];
+  } }), /cancelled/);
+  assert.equal(puts, beforeLockPuts);
   console.log('ok - WebDAV HTTP integration, encrypted merge, conflicts, races, errors and cancellation');
+  console.log('ok - Per-account conflict choices, cloud persistence, review cancellation and stale-choice rejection');
 } finally {
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 }

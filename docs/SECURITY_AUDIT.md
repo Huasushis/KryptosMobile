@@ -44,7 +44,7 @@
 
 - Manual sync reuses authenticated encrypted backup payloads; only account metadata is uploaded.
 - WebDAV credentials are held in the encrypted local vault. The backup password is entered per operation and cleared on completion/lock.
-- Conditional PUT with strong ETags prevents silent overwrites; conflicting generation data stops sync.
+- Conditional PUT with strong ETags prevents silent overwrites. Conflicts require explicit local/cloud choices for each account before upload; cancelled review or locking aborts without applying choices. Choices are tied to the downloaded snapshot and cannot override a newer ETag.
 - Android uses a native OkHttp transport with redirects disabled, TLS verification, cancellation, a 30-second timeout and bounded responses.
 - Android INTERNET permission is now enabled. Prefer HTTPS; explicitly configured HTTP endpoints send WebDAV credentials over plaintext transport.
 - Web preview requires provider CORS support and exposed ETag headers. See [setup and limitations](WEBDAV.md).

@@ -1,5 +1,5 @@
 import { bytesToBase64, utf8Bytes } from '../kryptos/bytes.ts';
-import { exportEntriesBase64Async, importEntriesBase64Async, normalizedIdentityKey, type AccountEntry } from '../kryptos/manager.ts';
+import { exportEntriesBase64Async, importEntriesBase64Async, normalizedIdentityKey, validateEntry, type AccountEntry } from '../kryptos/manager.ts';
 import type { KryptosCipherOptions } from '../kryptos/crypto.ts';
 
 export interface WebDavConfig {
@@ -34,22 +34,60 @@ export function davPaths(config: WebDavConfig): { directories: string[]; file: s
   return { directories, file: `${path}/${SYNC_FILENAME}` };
 }
 
-export function mergeForSync(local: readonly AccountEntry[], remote: readonly AccountEntry[]): AccountEntry[] {
-  const merged = [...local];
-  const seen = new Map(local.map((entry) => [normalizedIdentityKey(entry), entry]));
+export type SyncChoice = 'local' | 'remote';
+export interface SyncConflict {
+  local: AccountEntry;
+  remote: AccountEntry;
+}
+export interface SyncMergePlan {
+  entries: AccountEntry[];
+  conflicts: SyncConflict[];
+}
+
+export function planSyncMerge(local: readonly AccountEntry[], remote: readonly AccountEntry[]): SyncMergePlan {
+  // Validate each input separately so duplicate identities cannot be hidden by resolution.
+  for (const entries of [local, remote]) {
+    const identities = new Set<string>();
+    for (const entry of entries) {
+      validateEntry(entry);
+      const key = normalizedIdentityKey(entry);
+      if (identities.has(key)) throw new Error('Duplicate account in sync data.');
+      identities.add(key);
+    }
+  }
+  const merged = local.map((entry) => ({ ...entry }));
+  const conflicts: SyncConflict[] = [];
+  const seen = new Map(merged.map((entry) => [normalizedIdentityKey(entry), entry]));
   for (const entry of remote) {
     const key = normalizedIdentityKey(entry);
     const previous = seen.get(key);
     if (previous) {
       if (previous.webname !== entry.webname || previous.username !== entry.username || previous.uuid !== entry.uuid || previous.length !== entry.length || previous.charsetPreset !== entry.charsetPreset) {
-        throw new Error('Sync conflict: the same site/account has different password generation data. Resolve using encrypted backup import before syncing.');
+        conflicts.push({ local: { ...previous }, remote: { ...entry } });
       }
     } else {
-      merged.push(entry);
+      merged.push({ ...entry });
       seen.set(key, entry);
     }
   }
-  return merged;
+  if (merged.length > 10_000) throw new Error('Too many accounts for sync.');
+  return { entries: merged, conflicts };
+}
+
+export function resolveSyncMerge(plan: SyncMergePlan, choices: readonly SyncChoice[]): AccountEntry[] {
+  if (choices.length !== plan.conflicts.length || Array.from(choices).some((choice) => choice !== 'local' && choice !== 'remote')) {
+    throw new Error('Choose local or cloud for every sync conflict.');
+  }
+  const resolved = new Map(plan.conflicts.map((conflict, index) => [
+    normalizedIdentityKey(conflict.local), choices[index] === 'local' ? conflict.local : conflict.remote,
+  ]));
+  return plan.entries.map((entry) => ({ ...(resolved.get(normalizedIdentityKey(entry)) ?? entry) }));
+}
+
+export function mergeForSync(local: readonly AccountEntry[], remote: readonly AccountEntry[]): AccountEntry[] {
+  const plan = planSyncMerge(local, remote);
+  if (plan.conflicts.length) throw new Error('Sync conflict: choose local or cloud for each account.');
+  return plan.entries;
 }
 
 export async function syncWebDav(options: {
@@ -60,6 +98,7 @@ export async function syncWebDav(options: {
   transport: DavTransport;
   signal: AbortSignal;
   cipherOptions?: KryptosCipherOptions;
+  resolveConflicts?: (conflicts: readonly SyncConflict[]) => Promise<readonly SyncChoice[]>;
 }): Promise<AccountEntry[]> {
   const { config, backupPassword, signal } = options;
   if (!backupPassword) throw new Error('A separate backup password is required for sync.');
@@ -86,7 +125,7 @@ export async function syncWebDav(options: {
     }
   }
   const remote = await request(paths.file, 'GET');
-  let merged = [...options.entries];
+  let merged = planSyncMerge(options.entries, []).entries;
   let condition: Record<string, string>;
   if (remote.status === 404) {
     condition = { 'If-None-Match': '*' };
@@ -94,7 +133,16 @@ export async function syncWebDav(options: {
     if (!remote.etag || !/^"[^"\r\n]*"$/.test(remote.etag)) throw new Error('WebDAV must provide a strong ETag for safe sync.');
     const incoming = await importEntriesBase64Async(remote.body, backupPassword, options.cipherOptions);
     active();
-    merged = mergeForSync(merged, incoming);
+    const plan = planSyncMerge(merged, incoming);
+    if (plan.conflicts.length) {
+      if (!options.resolveConflicts) throw new Error('Sync conflict: choose local or cloud for each account.');
+      // Choices apply only to this GET snapshot. The original ETag still guards PUT.
+      const choices = await options.resolveConflicts(plan.conflicts.map((conflict) => ({ local: { ...conflict.local }, remote: { ...conflict.remote } })));
+      active();
+      merged = resolveSyncMerge(plan, choices);
+    } else {
+      merged = plan.entries;
+    }
     condition = { 'If-Match': remote.etag };
   } else {
     throw new Error(`Cannot read WebDAV backup (HTTP ${remote.status}).`);

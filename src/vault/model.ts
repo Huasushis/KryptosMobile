@@ -40,6 +40,21 @@ export function identityKey(entry: Pick<VaultEntry, 'webname' | 'username'>): st
   return normalizedIdentityKey(entry);
 }
 
+// Apply the selected account data even when it has the same identity as a local
+// entry. Reusing the entire old VaultEntry would silently discard cloud choices.
+export function syncAccountsToVaultEntries(accounts: readonly AccountEntry[], current: readonly VaultEntry[]): VaultEntry[] {
+  const existing = new Map(current.map((entry) => [identityKey(entry), entry]));
+  return accounts.map((account) => {
+    const previous = existing.get(identityKey(account));
+    if (!previous) return accountEntryToVaultEntry(account);
+    const unchanged = previous.webname === account.webname && previous.username === account.username &&
+      previous.uuid === account.uuid && previous.length === account.length && previous.charsetPreset === account.charsetPreset;
+    return unchanged ? previous : {
+      ...previous, ...account, updatedAt: new Date().toISOString(),
+    };
+  });
+}
+
 export function validateVaultState(value: unknown): VaultState {
   const fallback = emptyVault();
   if (!value || typeof value !== 'object') {
