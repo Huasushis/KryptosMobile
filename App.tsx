@@ -38,6 +38,9 @@ import {
   unlockVault,
 } from './src/vault/store.ts';
 import { emptyVault, type VaultEntry, type VaultSettings, type VaultState } from './src/vault/types.ts';
+import { accountEntryToVaultEntry, identityKey, vaultEntryToAccountEntry } from './src/vault/model.ts';
+import { davPaths, syncWebDav, type WebDavConfig } from './src/sync/webdav.ts';
+import { webDavTransport } from './src/platform/webdav.ts';
 
 type Screen = 'unlock' | 'prefix' | 'home' | 'entry' | 'edit' | 'settings' | 'backup';
 
@@ -71,6 +74,7 @@ export default function App() {
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [backupPassword, setBackupPassword] = useState('');
   const [backupText, setBackupText] = useState('');
+  const [davConfig, setDavConfig] = useState<WebDavConfig>({ url: '', directory: 'Kryptos', username: '', password: '' });
   const [message, setMessage] = useState('');
   const [clearConfirm, setClearConfirm] = useState(false);
   const [recoveryClearConfirm, setRecoveryClearConfirm] = useState(false);
@@ -85,6 +89,7 @@ export default function App() {
   const backupInFlight = useRef(false);
   const passwordActionInFlight = useRef(false);
   const operationGeneration = useRef(0);
+  const syncController = useRef<AbortController | null>(null);
 
   const selectedEntry = useMemo(
     () => vault.entries.find((entry) => entry.id === selectedId) ?? null,
@@ -167,6 +172,10 @@ export default function App() {
   }
 
   async function unlock(): Promise<void> {
+    if (syncController.current) {
+      setMessage('Finishing WebDAV cancellation. Retry unlock in a moment.');
+      return;
+    }
     if (unlockInFlight.current) {
       return;
     }
@@ -220,6 +229,8 @@ export default function App() {
   }
 
   function lockAll(nextMessage = 'Vault locked.', autoUnlock = false): void {
+    syncController.current?.abort();
+    setDavConfig({ url: '', directory: 'Kryptos', username: '', password: '' });
     operationGeneration.current += 1;
     autoUnlockAttempted.current = !autoUnlock;
     setVault(emptyVault());
@@ -381,6 +392,48 @@ export default function App() {
     }
   }
 
+  async function runWebDavSync(): Promise<void> {
+    if (backupInFlight.current) return;
+    const token = operationGeneration.current;
+    const controller = new AbortController();
+    syncController.current = controller;
+    backupInFlight.current = true;
+    setBackupBusy(true);
+    const timeout = setTimeout(() => controller.abort(), 120_000);
+    try {
+      davPaths(davConfig);
+      if (!backupPassword) throw new Error('Enter the same backup password on all devices.');
+      if (!await authenticateVault() || !isCurrentOperation(token)) return;
+      // Persist the connection inside the encrypted local vault, never in the remote export.
+      const configured = { ...vault, webdav: { ...davConfig } };
+      await saveVault(configured);
+      if (!isCurrentOperation(token)) return;
+      setVault(configured);
+      setMessage('Syncing encrypted metadata with WebDAV...');
+      await waitForUi();
+      const accounts = await syncWebDav({
+        config: davConfig, entries: vault.entries.map(vaultEntryToAccountEntry), backupPassword,
+        nonce: () => randomBytes(16), transport: webDavTransport, signal: controller.signal,
+      });
+      if (!isCurrentOperation(token) || controller.signal.aborted) return;
+      const existing = new Map(vault.entries.map((entry) => [identityKey(entry), entry]));
+      const entries = accounts.map((entry) => existing.get(identityKey(entry)) ?? accountEntryToVaultEntry(entry));
+      const next = { ...configured, entries };
+      await saveVault(next);
+      if (!isCurrentOperation(token)) return;
+      setVault(next);
+      setMessage(`WebDAV sync complete. ${entries.length} entries. Local deletions are not propagated.`);
+    } catch (error) {
+      if (isCurrentOperation(token)) setMessage(error instanceof Error ? error.message : 'WebDAV sync failed.');
+    } finally {
+      clearTimeout(timeout);
+      syncController.current = null;
+      backupInFlight.current = false;
+      setBackupBusy(false);
+      setBackupPassword('');
+    }
+  }
+
   async function exportBackup(): Promise<void> {
     noteActivity();
     if (backupInFlight.current) {
@@ -532,6 +585,10 @@ export default function App() {
   }
 
   async function clearLocalDataFromUnlock(): Promise<void> {
+    if (syncController.current) {
+      setMessage('Finishing WebDAV cancellation. Retry in a moment.');
+      return;
+    }
     if (!recoveryClearConfirm) {
       setRecoveryClearConfirm(true);
       setMessage('Tap Confirm clear on this screen to permanently delete the local vault and device key.');
@@ -589,6 +646,7 @@ export default function App() {
             onDelete={deleteEntry}
             onCreate={openCreate}
             onBackup={() => {
+              setDavConfig(vault.webdav ?? { url: '', directory: 'Kryptos', username: '', password: '' });
               setBackupPassword('');
               setBackupText('');
               setScreen('backup');
@@ -627,7 +685,11 @@ export default function App() {
             onCopyBackup={copyBackupToClipboard}
             onClearBackup={clearBackupText}
             busy={backupBusy}
+            davConfig={davConfig}
+            onDavChange={setDavConfig}
+            onSync={runWebDavSync}
             onBack={() => {
+              setDavConfig({ url: '', directory: 'Kryptos', username: '', password: '' });
               setBackupPassword('');
               setBackupText('');
               setScreen('home');
@@ -984,6 +1046,9 @@ function BackupScreen({
   onCopyBackup,
   onClearBackup,
   busy,
+  davConfig,
+  onDavChange,
+  onSync,
   onBack,
 }: {
   mode: 'merge' | 'replace';
@@ -996,6 +1061,9 @@ function BackupScreen({
   onCopyBackup: () => void;
   onClearBackup: () => void;
   busy: boolean;
+  davConfig: WebDavConfig;
+  onDavChange: (config: WebDavConfig) => void;
+  onSync: () => void;
   onBack: () => void;
 }) {
   const hasBackupText = backupText.length > 0;
@@ -1005,6 +1073,7 @@ function BackupScreen({
       <Text style={styles.bodyText}>Export/import uses KryptosCore Base64 format encrypted with a separate backup password. Export copies the backup to the clipboard; import reads backup text loaded from the clipboard. Import mode: {mode}.</Text>
       <TextInput
         value={backupPassword}
+        editable={!busy}
         onChangeText={onPasswordChange}
         secureTextEntry
         placeholder="Backup password"
@@ -1021,6 +1090,15 @@ function BackupScreen({
       <SecondaryButton label="Paste backup from clipboard" onPress={onPaste} disabled={busy} />
       <SecondaryButton label="Import loaded backup" onPress={onImport} disabled={busy || !hasBackupText} />
       <SecondaryButton label="Clear loaded backup" onPress={onClearBackup} disabled={busy || !hasBackupText} />
+      <Text style={styles.panelTitle}>WebDAV sync</Text>
+      <Text style={styles.bodyText}>Use the same directory and backup password on every device. Missing directories are created automatically. Sync merges additions; deletions are not propagated. Conflicting password data stops sync. Connection settings are saved encrypted on this device when syncing.</Text>
+      {(['url', 'directory', 'username', 'password'] as const).map((key) => (
+        <View key={key}>
+          <Text style={styles.label}>{({ url: 'WebDAV root URL', directory: 'Sync directory (relative to root URL)', username: 'WebDAV username', password: 'WebDAV password / app token' })[key]}</Text>
+          <TextInput value={davConfig[key]} editable={!busy} onChangeText={(value) => onDavChange({ ...davConfig, [key]: value })} secureTextEntry={key === 'password'} autoCapitalize="none" autoCorrect={false} style={styles.input} />
+        </View>
+      ))}
+      <PrimaryButton label="Sync with WebDAV" onPress={onSync} disabled={busy} />
       <SecondaryButton label="Back" onPress={onBack} disabled={busy} />
     </ScrollView>
   );

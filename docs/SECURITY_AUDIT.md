@@ -40,7 +40,16 @@
 - Import parsing rejects invalid headers, invalid counts, malformed field counts, overly long fields, unsupported lengths, duplicate site/username pairs, and non-empty trailing data after the declared entry count.
 - Loaded vault state is validated and rejects duplicate site/username entries while clamping settings to supported ranges.
 
-## Known Limits
+## WebDAV synchronization
+
+- Manual sync reuses authenticated encrypted backup payloads; only account metadata is uploaded.
+- WebDAV credentials are held in the encrypted local vault. The backup password is entered per operation and cleared on completion/lock.
+- Conditional PUT with strong ETags prevents silent overwrites; conflicting generation data stops sync.
+- Android uses a native OkHttp transport with redirects disabled, TLS verification, cancellation, a 30-second timeout and bounded responses.
+- Android INTERNET permission is now enabled. Prefer HTTPS; explicitly configured HTTP endpoints send WebDAV credentials over plaintext transport.
+- Web preview requires provider CORS support and exposed ETag headers. See [setup and limitations](WEBDAV.md).
+
+## Existing platform limits
 
 - JavaScript strings cannot be reliably zeroed after decryption. Decrypted prefix/password values are scoped tightly and not persisted.
 - Web preview cannot enforce biometric unlock or screen-capture blocking.

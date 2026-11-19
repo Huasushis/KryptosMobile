@@ -18,10 +18,10 @@
       "package": "com.huasushis.kryptosmobile",
       "permissions": [
         "USE_BIOMETRIC",
-        "USE_FINGERPRINT"
+        "USE_FINGERPRINT",
+        "INTERNET"
       ],
       "blockedPermissions": [
-        "android.permission.INTERNET",
         "android.permission.SYSTEM_ALERT_WINDOW",
         "android.permission.VIBRATE",
         "android.permission.READ_EXTERNAL_STORAGE",

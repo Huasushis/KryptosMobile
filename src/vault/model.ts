@@ -85,6 +85,12 @@ export function validateVaultState(value: unknown): VaultState {
     version: 1,
     entries: cleanEntries,
     settings,
+    ...(candidate.webdav ? { webdav: {
+      url: String(candidate.webdav.url ?? ''),
+      directory: String(candidate.webdav.directory ?? 'Kryptos'),
+      username: String(candidate.webdav.username ?? ''),
+      password: String(candidate.webdav.password ?? ''),
+    } } : {}),
   };
 }
 

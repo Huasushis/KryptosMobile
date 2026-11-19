@@ -103,6 +103,9 @@ export function deserializeEntries(text: string): AccountEntry[] {
     }
     const length = Number(fields[3]);
     const charsetPreset = unescapeField(fields[4]);
+    if (charsetPreset !== 'full' && charsetPreset !== 'alphanum') {
+      throw new Error('unsupported charset preset');
+    }
     const entry: AccountEntry = {
       webname: unescapeField(fields[0]),
       uuid: unescapeField(fields[1]),

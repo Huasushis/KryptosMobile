@@ -7,7 +7,7 @@ import com.facebook.react.uimanager.ViewManager
 
 class KryptosCryptoPackage : ReactPackage {
   override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> {
-    return listOf(KryptosCryptoModule(reactContext))
+    return listOf(KryptosCryptoModule(reactContext), KryptosWebDavModule(reactContext))
   }
 
   override fun createViewManagers(

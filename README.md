@@ -43,6 +43,11 @@ node --experimental-strip-types tests/run.ts
 
 ## Android APK
 
+GitHub Actions now builds standalone APKs automatically on push, or manually from
+**Actions → Android APK**. Download the APK from the run's Artifacts. Builds need
+no signing secrets for previews; configure the four Android signing secrets for
+stable release signing. See [WebDAV and APK setup](docs/WEBDAV.md).
+
 This workspace can build a debug APK locally on Windows:
 
 ```bash
@@ -74,7 +79,9 @@ Release signing material is generated locally at `android/app/kryptos-release.ke
 - Mobile unlock requires enrolled system authentication; Web preview is explicitly marked as degraded.
 - UI state is updated after vault writes succeed, so failed writes do not pretend to be saved.
 - Export files are encrypted with a separate backup password.
-- No cloud sync, analytics SDK, or remote logging is included in v1.
+- Manual WebDAV sync uploads only encrypted KryptosCore-compatible metadata.
+- WebDAV settings are stored inside the encrypted local vault; the sync backup password is never stored.
+- No analytics SDK or remote logging is included.
 
 ## Implemented Screens
 
@@ -83,7 +90,7 @@ Release signing material is generated locally at `android/app/kryptos-release.ke
 - Home: searchable metadata list with add, backup, settings, prefix, and lock actions.
 - Entry detail: generate/show/copy password without listing stored passwords.
 - Edit: site, username, length, and `full`/`alphanum` charset controls with duplicate blocking.
-- Backup: KryptosCore-compatible encrypted Base64 import/export with merge/replace policy.
+- Backup: KryptosCore-compatible encrypted Base64 import/export with merge/replace policy, plus WebDAV sync with automatic directory creation and conditional uploads.
 - Settings: auto-lock, background-lock, screenshot blocking, import mode, and two-step vault clear.
 
 ## Current Verification

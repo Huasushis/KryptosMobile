@@ -1,4 +1,5 @@
 import type { CharsetPreset } from '../kryptos/core.ts';
+import type { WebDavConfig } from '../sync/webdav.ts';
 
 export interface VaultEntry {
   id: string;
@@ -15,6 +16,7 @@ export interface VaultState {
   version: 1;
   entries: VaultEntry[];
   settings: VaultSettings;
+  webdav?: WebDavConfig;
 }
 
 export interface VaultSettings {
