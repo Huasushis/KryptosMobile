@@ -80,7 +80,7 @@ jobs:
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon --max-workers 2 -PkryptosVersionCode="${{ steps.version.outputs.code }}" -PkryptosVersionName="${{ steps.version.outputs.name }}" 2>&1 | tee gradle-build.log
+          ./gradlew :app:testReleaseUnitTest assembleRelease --no-daemon --max-workers 2 -PkryptosVersionCode="${{ steps.version.outputs.code }}" -PkryptosVersionName="${{ steps.version.outputs.name }}" 2>&1 | tee gradle-build.log
       - name: Report build failure
         if: failure()
         run: |

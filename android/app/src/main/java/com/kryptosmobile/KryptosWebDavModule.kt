@@ -6,13 +6,10 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
 
 class KryptosWebDavModule(context: ReactApplicationContext) : ReactContextBaseJavaModule(context) {
   private val calls = ConcurrentHashMap<String, Call>()
-  private val client = OkHttpClient.Builder()
-    .followRedirects(false).followSslRedirects(false)
-    .callTimeout(30, TimeUnit.SECONDS).build()
+  private val client = createWebDavClient()
 
   override fun getName() = "KryptosWebDav"
 
