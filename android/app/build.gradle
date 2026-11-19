@@ -98,7 +98,7 @@ android {
         applicationId "com.huasushis.kryptosmobile"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode (findProperty('kryptosVersionCode') ?: '1').toInteger()
+        versionCode = (project.findProperty('kryptosVersionCode') ?: '1').toString().toInteger()
         versionName "1.0"
 
         buildConfigField "String", "REACT_NATIVE_RELEASE_LEVEL", "\"${findProperty('reactNativeReleaseLevel') ?: 'stable'}\""
