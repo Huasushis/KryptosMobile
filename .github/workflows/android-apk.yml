@@ -62,7 +62,18 @@ jobs:
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon --max-workers 2 -PkryptosVersionCode="$GITHUB_RUN_NUMBER"
+          ./gradlew assembleRelease --no-daemon --max-workers 2 -PkryptosVersionCode="$GITHUB_RUN_NUMBER" 2>&1 | tee gradle-build.log
+      - name: Report build failure
+        if: failure()
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          log = Path('android/gradle-build.log')
+          if log.exists():
+              tail = log.read_text(errors='replace')[-12000:]
+              message = tail.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print('::error title=Android build failure::' + message)
+          PY
       - name: Package APK
         env:
           SIGNING_MODE: ${{ steps.signing.outputs.mode }}
