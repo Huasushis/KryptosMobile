@@ -40,11 +40,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22.14.0'
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
+      # GitHub's Ubuntu runner already has an Android SDK and accepted licenses.
+      # AGP installs any missing pinned NDK/build-tools from that SDK as needed.
+      - name: Check Android SDK
+        run: test -d "$ANDROID_HOME"
       - uses: gradle/actions/setup-gradle@v4
       - run: pnpm install --frozen-lockfile --prod=false
       - name: Prepare signing
