@@ -71,9 +71,11 @@ jobs:
           from pathlib import Path
           log = Path('android/gradle-build.log')
           if log.exists():
-              tail = log.read_text(errors='replace')[-12000:]
-              message = tail.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-              print('::error title=Android build failure::' + message)
+              tail = log.read_text(errors='replace')[-9000:]
+              # GitHub truncates long annotations; keep the final error visible.
+              for index in range(0, len(tail), 2500):
+                  message = tail[index:index + 2500].replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+                  print('::error title=Android build failure::' + message)
           PY
       - name: Package APK
         env:
